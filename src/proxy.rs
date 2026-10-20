@@ -1852,6 +1852,9 @@ async fn serve_core<R, W>(
             return;
         }
     }
+    // Первый байт нужен для диагностики после расшифровки (handshake ниже
+    // перемещается в decrypted): 0x16 = TLS ClientHello = старая ee-ссылка.
+    let first_byte = handshake[0];
 
     if is_http_transport(&handshake) {
         STATS.connections_http_reject.fetch_add(1, Ordering::Relaxed);
@@ -1877,7 +1880,30 @@ async fn serve_core<R, W>(
     let proto = LittleEndian::read_u32(proto_tag);
     if !valid_proto(proto) {
         STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
-        lwarn!("[{}] bad handshake (wrong secret or proto)", label);
+        BAD_HANDSHAKES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        // Telegram ретраит подключение постоянно, поэтому без ограничения
+        // лог превращался в бесконечный спам. Пишем не чаще раза в 10 секунд
+        // и сообщаем, сколько повторов скрыто.
+        if let Some(suppressed) = bad_handshake_log_gate(10) {
+            let hint = if PROXY_SECRET.read().as_str() == "00000000000000000000000000000000" {
+                "прокси запущен без секрета"
+            } else if first_byte == faketls::TLS_RECORD_HANDSHAKE {
+                "клиент прислал FakeTLS ClientHello: в Telegram осталась старая ee-ссылка"
+            } else {
+                "секрет в Telegram не совпадает с активным"
+            };
+            if suppressed > 0 {
+                lwarn!(
+                    "[{}] bad handshake ({}): ещё {} попыток за последние 10 с скрыто. Перепримените ссылку из приложения",
+                    label, hint, suppressed
+                );
+            } else {
+                lwarn!(
+                    "[{}] bad handshake ({}). Перепримените ссылку из приложения: Настройки/Главная -> «Применить в Telegram»",
+                    label, hint
+                );
+            }
+        }
         return;
     }
 

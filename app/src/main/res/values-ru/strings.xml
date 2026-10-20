@@ -118,6 +118,13 @@
     <string name="nav_logs">Логи</string>
     <string name="invalid_port">Неверный порт</string>
     <string name="notification_starting">Запуск прокси...</string>
+    <string name="notification_bad_secret">Некорректный секрет прокси (нужно 32 hex-символа). Перезапустите прокси из приложения</string>
+    <string name="secret_verified_ok">Секрет совпадает с активным прокси</string>
+    <string name="secret_verified_mismatch">Секрет НЕ совпадает с активным прокси — нажмите «Применить в Telegram» заново</string>
+    <string name="secret_verified_invalid">Секрет некорректен: нужно 32 hex-символа</string>
+    <string name="secret_check">Проверить</string>
+    <string name="secret_check_need_running">Сначала запустите прокси</string>
+    <string name="secret_mismatch_banner">Telegram использует другой секрет: прокси отклоняет подключения («bad handshake»). Нажмите «Применить в Telegram», чтобы обновить ссылку.</string>
     <string name="notification_start_error_code">Ошибка запуска (код: %1$d)</string>
     <string name="notification_error">Ошибка: %1$s</string>
     <string name="notification_running">Прокси работает</string>

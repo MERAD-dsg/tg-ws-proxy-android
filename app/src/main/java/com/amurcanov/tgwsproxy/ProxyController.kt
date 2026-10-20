@@ -95,14 +95,9 @@ object ProxyController {
     }
 
     private suspend fun ensureSecretKey(settingsStore: SettingsStore): String {
-        val current = settingsStore.secretKey.first().trim()
-        if (isValidSecret(current)) {
-            return current
-        }
-
-        val generated = generateRandomSecret()
-        settingsStore.saveSecretKey(generated)
-        return generated
+        // Атомарно: либо существующий корректный секрет, либо новый — ровно
+        // тот, который сохранится, и который увидит пользователь.
+        return settingsStore.getOrCreateSecret()
     }
 
     private fun MutableList<String>.appendDc(dc: Int, value: String) {
@@ -112,13 +107,4 @@ object ProxyController {
         }
     }
 
-    private fun generateRandomSecret(): String {
-        val bytes = ByteArray(16)
-        java.security.SecureRandom().nextBytes(bytes)
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun isValidSecret(value: String): Boolean {
-        return value.length == 32 && value.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
-    }
 }

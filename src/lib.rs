@@ -83,11 +83,20 @@ pub unsafe extern "C" fn StartProxy(
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
 
-    if secret_str.len() == 32 {
-        if hex::decode(&secret_str).is_ok() {
-            *PROXY_SECRET.write() = secret_str.clone();
+    // Секрет обязателен: без него прокси поднимался с дефолтным `0000…`,
+    // Telegram не мог пройти рукопожатие и в логах шёл бесконечный
+    // «bad handshake (wrong secret or proto)». Теперь это явная ошибка.
+    let secret_str = match sanitize_secret(&secret_str) {
+        Some(s) => s,
+        None => {
+            lerror!(
+                "StartProxy: некорректный MTProto-секрет (нужно 32 hex-символа, получено {} симв.)",
+                secret_str.trim().chars().count()
+            );
+            return -4;
         }
-    }
+    };
+    *PROXY_SECRET.write() = secret_str.clone();
 
     cfproxy::init_cfproxy_domains();
 
@@ -412,13 +421,39 @@ pub extern "C" fn SetProxyProtocol(v: c_int) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
     let s = cstr_to_string(c_secret);
-    if s.len() != 32 {
-        return;
+    match sanitize_secret(&s) {
+        Some(v) => *PROXY_SECRET.write() = v,
+        None => lwarn!("SetSecret: некорректный секрет проигнорирован"),
     }
-    if hex::decode(&s).is_err() {
-        return;
+}
+
+/// Активный секрет, с которым реально работает прокси (32 hex).
+/// Нужен UI, чтобы ссылка и настройки всегда совпадали с нативным состоянием.
+#[unsafe(no_mangle)]
+pub extern "C" fn GetActiveSecret() -> *mut c_char {
+    let s = PROXY_SECRET.read().clone();
+    CString::new(s).unwrap_or_default().into_raw()
+}
+
+/// Сверка секрета из UI с активным секретом прокси.
+/// 1 — совпадает, 0 — не совпадает, -1 — некорректный формат.
+///
+/// # Safety
+/// `c_secret` — валидная C-строка или null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VerifyClientSecret(c_secret: *const c_char) -> c_int {
+    let raw = cstr_to_string(c_secret);
+    match sanitize_secret(&raw) {
+        Some(v) => {
+            let active = PROXY_SECRET.read().clone();
+            if v == active {
+                1
+            } else {
+                0
+            }
+        }
+        None => -1,
     }
-    *PROXY_SECRET.write() = s;
 }
 
 #[unsafe(no_mangle)]

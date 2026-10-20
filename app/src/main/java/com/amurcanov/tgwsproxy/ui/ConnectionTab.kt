@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -37,10 +38,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.BuildConfig
+import com.amurcanov.tgwsproxy.NativeProxy
 import com.amurcanov.tgwsproxy.ProxyController
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
 import com.amurcanov.tgwsproxy.R
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -75,10 +78,9 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     // Auto-generate secret if empty
     LaunchedEffect(savedSecretKey) {
         if (savedSecretKey == "") {
-            val bytes = ByteArray(16)
-            java.security.SecureRandom().nextBytes(bytes)
-            val generated = bytes.joinToString("") { "%02x".format(it) }
-            scope.launch { settingsStore.saveSecretKey(generated) }
+            // Единая атомарная генерация (см. SettingsStore.getOrCreateSecret):
+            // главный экран и запуск прокси всегда используют один и тот же секрет.
+            scope.launch { settingsStore.getOrCreateSecret() }
         }
     }
 
@@ -102,6 +104,39 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     }
     val bindIp = savedBindIp.trim().takeIf { it.isNotEmpty() } ?: "127.0.0.1"
     val proxyUrl = "https://t.me/proxy?server=$bindIp&port=$port&secret=dd$secretForUrl"
+
+    // Сверка секрета из настроек с секретом, с которым реально работает
+    // нативный прокси. Если они разошлись (старая ссылка в Telegram,
+    // переустановка, смена секрета) — показываем явное предупреждение
+    // вместо бесконечного «bad handshake» в логах.
+    var secretMismatch by remember { mutableStateOf(false) }
+    var recentRejections by remember { mutableStateOf(false) }
+    LaunchedEffect(isRunning, isVerifiedRunning, savedSecretKey) {
+        secretMismatch = if (isRunning || isVerifiedRunning) {
+            runCatching { NativeProxy.verifyClientSecret(secretForUrl) == 0 }.getOrDefault(false)
+        } else {
+            false
+        }
+    }
+    // Счётчик bad= растёт, когда Telegram стучится со старым секретом.
+    // Показываем предупреждение только пока отказы свежие, чтобы после
+    // переприменения ссылки оно исчезало само.
+    LaunchedEffect(isRunning, isVerifiedRunning) {
+        var lastBad = -1
+        var showUntil = 0L
+        while (isRunning || isVerifiedRunning) {
+            runCatching { NativeProxy.getStats() }.getOrNull()?.let { stats ->
+                val bad = stats.substringAfter("bad=", "0").takeWhile { it.isDigit() }.toIntOrNull() ?: 1
+                if (lastBad >= 0 && bad > lastBad) {
+                    showUntil = System.currentTimeMillis() + 30_000
+                }
+                lastBad = bad
+            }
+            recentRejections = System.currentTimeMillis() < showUntil
+            delay(2000)
+        }
+        recentRejections = false
+    }
     
     var applyMode by rememberSaveable { mutableStateOf("packages") }
 
@@ -236,6 +271,31 @@ fun ConnectionTab(settingsStore: SettingsStore) {
                         color = statusColor,
                         textAlign = TextAlign.Center
                     )
+
+                    if (secretMismatch || recentRejections) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Warning,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(
+                                    text = stringResource(R.string.secret_mismatch_banner),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
 
                     Column(
                         modifier = Modifier.fillMaxWidth(),

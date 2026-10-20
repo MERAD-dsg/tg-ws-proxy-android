@@ -22,6 +22,27 @@ class SettingsStore(private val context: Context) {
         private const val LEGACY_DIRECT_DC_IP = "149.154.167.220"
         const val DEFAULT_LOG_SHOW_INFO = true
         const val DEFAULT_LOG_SHOW_ERROR = false
+
+        /**
+         * Приводит секрет к каноническому виду: 32 hex-символа в нижнем регистре.
+         * Принимает значение как есть, а также полный секрет из ссылки Telegram
+         * (`dd<hex>` или `ee<hex><domain>`) и лишние пробелы.
+         * null — значение не является корректным секретом.
+         */
+        fun normalizeSecret(raw: String): String? {
+            val s = raw.trim().lowercase()
+            if (s.isEmpty()) return null
+            val body = if (s.length > 32 && (s.startsWith("dd") || s.startsWith("ee"))) s.substring(2) else s
+            if (body.length < 32) return null
+            val secret = body.substring(0, 32)
+            return if (secret.all { it in "0123456789abcdef" }) secret else null
+        }
+
+        fun generateRandomSecret(): String {
+            val bytes = ByteArray(16)
+            java.security.SecureRandom().nextBytes(bytes)
+            return bytes.joinToString("") { "%02x".format(it) }
+        }
     }
 
     private object Keys {
@@ -116,7 +137,32 @@ class SettingsStore(private val context: Context) {
     val updateDialogLastActionAt: Flow<Long> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
 
     suspend fun saveSecretKey(key: String) {
-        context.dataStore.edit { it[Keys.SECRET_KEY] = key }
+        val normalized = normalizeSecret(key) ?: return
+        context.dataStore.edit { it[Keys.SECRET_KEY] = normalized }
+    }
+
+    /**
+     * Атомарно возвращает сохранённый секрет, а если его нет/он битый —
+     * генерирует и сохраняет новый.
+     *
+     * Важно: раньше генерация была в двух местах (главный экран и запуск
+     * прокси), и при гонке в Telegram попадал один секрет, а прокси
+     * запускался с другим — Telegram получал «bad handshake».
+     */
+    suspend fun getOrCreateSecret(): String {
+        var result = ""
+        context.dataStore.edit { prefs ->
+            val existing = normalizeSecret(prefs[Keys.SECRET_KEY].orEmpty())
+            result = if (existing != null) {
+                if (prefs[Keys.SECRET_KEY] != existing) prefs[Keys.SECRET_KEY] = existing
+                existing
+            } else {
+                val generated = generateRandomSecret()
+                prefs[Keys.SECRET_KEY] = generated
+                generated
+            }
+        }
+        return result
     }
 
     suspend fun saveThemeMode(mode: String) {
@@ -228,7 +274,13 @@ class SettingsStore(private val context: Context) {
             it[Keys.CF_WORKER_DOMAINS] = cfWorkerDomains
             it[Keys.DPI_BYPASS_ENABLED] = dpiBypassEnabled
             it[Keys.UPSTREAM_PROXY_URL] = upstreamProxyUrl
-            it[Keys.SECRET_KEY] = secretKey
+            // Пустое/битое значение из UI не должно затирать рабочий секрет:
+            // иначе прокси перезапустится с новым секретом, а в Telegram
+            // останется старая ссылка («bad handshake»).
+            val normalizedSecret = normalizeSecret(secretKey)
+            if (normalizedSecret != null) {
+                it[Keys.SECRET_KEY] = normalizedSecret
+            }
         }
     }
 }

@@ -206,6 +206,9 @@ class ProxyService : Service() {
                 NativeProxy.setDpiBypass(dpiBypass)
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
+                    // Самоисцеление секрета: ссылка в Telegram должна совпадать
+                    // с тем секретом, с которым реально работает нативный прокси.
+                    syncActiveSecret(secretKey)
                     serviceScope.launch {
                         if (!stopInProgress) {
                             updateRunningState(true)
@@ -213,6 +216,13 @@ class ProxyService : Service() {
                             updateNotification(getString(R.string.notification_running), force = true)
                             Log.i(TAG, "Proxy ready: listening on port $port")
                         }
+                    }
+                } else if (result == -4) {
+                    Log.e(TAG, "StartProxy rejected the MTProto secret")
+                    serviceScope.launch {
+                        updateNotification(getString(R.string.notification_bad_secret), force = true)
+                        delay(5000.milliseconds)
+                        stopProxy()
                     }
                 } else {
                     Log.e(TAG, "StartProxy returned error code: $result")
@@ -265,6 +275,31 @@ class ProxyService : Service() {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Если пользователь успел сменить секрет, а прокси уже был запущен —
+     * нативный секрет отличается от сохранённого. Приводим хранилище к
+     * фактическому секрету, чтобы ссылка «Применить в Telegram» не расходилась
+     * с прокси (иначе Telegram бесконечно присылает «bad handshake»).
+     */
+    private fun syncActiveSecret(requested: String) {
+        try {
+            val active = NativeProxy.getActiveSecret() ?: return
+            val normalizedActive = SettingsStore.normalizeSecret(active) ?: return
+            val requestedNormalized = SettingsStore.normalizeSecret(requested)
+            if (requestedNormalized != normalizedActive) {
+                Log.w(
+                    TAG,
+                    "Active proxy secret differs from requested; syncing settings to the active one"
+                )
+                CoroutineScope(Dispatchers.IO).launch {
+                    SettingsStore(applicationContext).saveSecretKey(normalizedActive)
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "syncActiveSecret failed", e)
         }
     }
 

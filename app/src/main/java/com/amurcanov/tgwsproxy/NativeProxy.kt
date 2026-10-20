@@ -24,6 +24,8 @@ interface ProxyLibrary : Library {
     fun SetForceTestDc(v: Int)
     fun SetProxyProtocol(v: Int)
     fun GetSecretWithPrefix(): Pointer?
+    fun GetActiveSecret(): Pointer?
+    fun VerifyClientSecret(secret: String): Int
     fun GetStats(): Pointer?
     fun GetDomainsSummary(): Pointer?
     fun FreeString(p: Pointer)
@@ -114,6 +116,22 @@ object NativeProxy {
         val res = ptr.getString(0)
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
+    }
+
+    /** Секрет, с которым реально работает нативный прокси (32 hex). */
+    fun getActiveSecret(): String? {
+        val ptr = ProxyLibrary.INSTANCE.GetActiveSecret() ?: return null
+        val res = ptr.getString(0)
+        ProxyLibrary.INSTANCE.FreeString(ptr)
+        return res
+    }
+
+    /**
+     * Сверка секрета из UI с активным секретом прокси.
+     * 1 — совпадает, 0 — не совпадает, -1 — некорректный формат.
+     */
+    fun verifyClientSecret(secret: String): Int {
+        return ProxyLibrary.INSTANCE.VerifyClientSecret(secret)
     }
 
     fun getStats(): String? {

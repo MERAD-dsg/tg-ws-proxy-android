@@ -118,6 +118,13 @@
     <string name="nav_logs">Logs</string>
     <string name="invalid_port">Invalid port</string>
     <string name="notification_starting">Starting proxy...</string>
+    <string name="notification_bad_secret">Invalid proxy secret (32 hex characters required). Restart the proxy from the app</string>
+    <string name="secret_verified_ok">Secret matches the active proxy</string>
+    <string name="secret_verified_mismatch">Secret does NOT match the active proxy — apply the Telegram link again</string>
+    <string name="secret_verified_invalid">Invalid secret: 32 hex characters required</string>
+    <string name="secret_check">Check</string>
+    <string name="secret_check_need_running">Start the proxy first</string>
+    <string name="secret_mismatch_banner">Telegram is using a different secret, so the proxy rejects its connections (bad handshake). Tap "Apply to Telegram" to refresh the link.</string>
     <string name="notification_start_error_code">Start error (code: %1$d)</string>
     <string name="notification_error">Error: %1$s</string>
     <string name="notification_running">Proxy is running</string>

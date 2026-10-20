@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
@@ -35,17 +36,12 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.amurcanov.tgwsproxy.NativeProxy
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-
-private fun generateRandomSecret(): String {
-    val bytes = ByteArray(16)
-    java.security.SecureRandom().nextBytes(bytes)
-    return bytes.joinToString("") { "%02x".format(it) }
-}
 
 fun openTelegram(context: Context, url: String) {
     try {
@@ -97,7 +93,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
-    if (!isReady) {
+    if (!isReady || savedSecretKey == "LOADING") {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator(
                 color = MaterialTheme.colorScheme.primary,
@@ -137,12 +133,21 @@ fun SettingsTab(settingsStore: SettingsStore) {
 
     LaunchedEffect(savedSecretKey) {
         if (savedSecretKey == "") {
-            val generated = generateRandomSecret()
+            // Единая атомарная генерация: тот же секрет увидит и главный экран,
+            // и запуск прокси. Раньше генераторов было два и они гонялись.
+            val generated = settingsStore.getOrCreateSecret()
             secretKeyText = generated
-            settingsStore.saveSecretKey(generated)
         } else if (savedSecretKey != "LOADING") {
             secretKeyText = savedSecretKey
         }
+    }
+
+    // Статус проверки секрета (кнопка «Проверить»): совпадает ли он с тем,
+    // с которым реально работает запущенный прокси.
+    var secretCheckResult by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(isRunning, secretKeyText) {
+        // при смене состояния перезапуска/секрета сбрасываем прошлый результат
+        secretCheckResult = null
     }
 
     var saveJob by remember { mutableStateOf<Job?>(null) }
@@ -156,7 +161,9 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 dc1mText, dc2mText, dc3mText, dc4mText, dc5mText, dc203mText,
                 experimentalMode, bindIpText, portText, selectedPoolSize,
                 cfEnabled, customCfDomainEnabled, customCfDomain,
-                cfExtraUrls, dpiBypassEnabled, upstreamProxyUrl, secretKeyText,
+                cfExtraUrls, dpiBypassEnabled, upstreamProxyUrl,
+                // Пустое/битое поле не должно затирать рабочий секрет.
+                secretKeyText.ifBlank { savedSecretKey },
                 cfWorkerDomains
             )
         }
@@ -366,16 +373,41 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     shape = RoundedCornerShape(24.dp),
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
                     trailingIcon = {
-                        IconButton(
-                            onClick = {
-                                val newKey = generateRandomSecret()
-                                secretKeyText = newKey
-                                scope.launch { settingsStore.saveSecretKey(newKey) }
-                                scheduleSave()
-                            },
-                            enabled = !isRunning
-                        ) {
-                            Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.primary)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = {
+                                    secretCheckResult = if (isRunning) {
+                                        runCatching {
+                                            NativeProxy.verifyClientSecret(secretKeyText)
+                                        }.getOrDefault(-1)
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(com.amurcanov.tgwsproxy.R.string.secret_check_need_running),
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        null
+                                    }
+                                }
+                            ) {
+                                Icon(
+                                    Icons.Default.CheckCircle,
+                                    contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.secret_check),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    val newKey = SettingsStore.generateRandomSecret()
+                                    secretKeyText = newKey
+                                    scope.launch { settingsStore.saveSecretKey(newKey) }
+                                    secretCheckResult = null
+                                    scheduleSave()
+                                },
+                                enabled = !isRunning
+                            ) {
+                                Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.primary)
+                            }
                         }
                     },
                     colors = OutlinedTextFieldDefaults.colors(
@@ -383,6 +415,18 @@ fun SettingsTab(settingsStore: SettingsStore) {
                         unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
                     )
                 )
+                secretCheckResult?.let { result ->
+                    val (textRes, color) = when (result) {
+                        1 -> com.amurcanov.tgwsproxy.R.string.secret_verified_ok to MaterialTheme.colorScheme.primary
+                        0 -> com.amurcanov.tgwsproxy.R.string.secret_verified_mismatch to MaterialTheme.colorScheme.error
+                        else -> com.amurcanov.tgwsproxy.R.string.secret_verified_invalid to MaterialTheme.colorScheme.error
+                    }
+                    Text(
+                        stringResource(textRes),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = color
+                    )
+                }
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))

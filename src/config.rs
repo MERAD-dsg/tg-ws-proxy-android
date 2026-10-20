@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -316,6 +316,59 @@ pub fn canonicalize_pool_entry(raw: &str) -> Option<String> {
 // MTProto proxy secret
 pub static PROXY_SECRET: Lazy<RwLock<String>> =
     Lazy::new(|| RwLock::new("00000000000000000000000000000000".to_string()));
+
+/// Нормализация секрета: принимает `dd<32hex>`, `ee<32hex><domain_hex>`,
+/// голые 32 hex, лишние пробелы. Возвращает ровно 32 hex-символа в нижнем
+/// регистре либо None.
+///
+/// Раньше невалидный секрет молча игнорировался, и прокси стартовал с
+/// дефолтным `0000…`: Telegram присылал свой секрет, расшифровка не сходилась,
+/// и в логах бесконечно сыпалось «bad handshake (wrong secret or proto)».
+pub fn sanitize_secret(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Полный секрет из ссылки Telegram: dd/ee + сам секрет (+ домен для ee).
+    let body = if lower.len() > 32 && (lower.starts_with("dd") || lower.starts_with("ee")) {
+        &lower[2..]
+    } else {
+        &lower[..]
+    };
+    if body.len() < 32 {
+        return None;
+    }
+    let secret = &body[..32];
+    if secret.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(secret.to_string())
+    } else {
+        None
+    }
+}
+
+/// Не чаще одного сообщения в `window_secs`; возвращает число подавленных
+/// повторов (0 — если это первое сообщение в окне).
+static BAD_HANDSHAKE_LAST_LOG: AtomicU64 = AtomicU64::new(0);
+static BAD_HANDSHAKE_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn bad_handshake_log_gate(window_secs: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = BAD_HANDSHAKE_LAST_LOG.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= window_secs {
+        BAD_HANDSHAKE_LAST_LOG.store(now, Ordering::Relaxed);
+        Some(BAD_HANDSHAKE_SUPPRESSED.swap(0, Ordering::Relaxed))
+    } else {
+        BAD_HANDSHAKE_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Сколько всего было «плохих» рукопожатий (для диагностики/UI).
+pub static BAD_HANDSHAKES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // proxy/config.py::_CFPROXY_ENC — полный список из 20 доменов оригинала.
 pub static CFPROXY_ENC: &[&str] = &[
