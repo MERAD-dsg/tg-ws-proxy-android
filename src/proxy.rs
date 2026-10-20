@@ -2270,7 +2270,7 @@ async fn serve_core<R, W>(
         conn_read,
         conn_write,
         ws,
-        label,
+        label.clone(),
         dc,
         is_media,
         splitter,
