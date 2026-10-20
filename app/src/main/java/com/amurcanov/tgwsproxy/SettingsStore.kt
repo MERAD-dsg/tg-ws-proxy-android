@@ -66,6 +66,7 @@ class SettingsStore(private val context: Context) {
         val UPSTREAM_PROXY_URL = stringPreferencesKey("upstream_proxy_url")
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
         val SECRET_KEY = stringPreferencesKey("secret_key")
+        val SECRET_HISTORY = stringPreferencesKey("secret_history")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -118,6 +119,13 @@ class SettingsStore(private val context: Context) {
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
 
+    /**
+     * Недавние секреты: прокси принимает их наравне с активным, чтобы после
+     * смены секрета старая ссылка в Telegram продолжала работать
+     * (иначе — «bad handshake» и шторм переподключений).
+     */
+    val secretHistory: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_HISTORY] ?: "" }
+
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
     val logShowError: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_ERROR] ?: DEFAULT_LOG_SHOW_ERROR }
@@ -138,7 +146,20 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveSecretKey(key: String) {
         val normalized = normalizeSecret(key) ?: return
-        context.dataStore.edit { it[Keys.SECRET_KEY] = normalized }
+        context.dataStore.edit { prefs ->
+            val prev = normalizeSecret(prefs[Keys.SECRET_KEY].orEmpty())
+            if (prev != null && prev != normalized) {
+                prefs[Keys.SECRET_HISTORY] = pushHistory(prefs[Keys.SECRET_HISTORY].orEmpty(), prev)
+            }
+            prefs[Keys.SECRET_KEY] = normalized
+        }
+    }
+
+    private fun pushHistory(existing: String, secret: String): String {
+        val items = existing.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+        items.remove(secret)
+        items.add(0, secret)
+        return items.take(3).joinToString(",")
     }
 
     /**
@@ -158,6 +179,12 @@ class SettingsStore(private val context: Context) {
                 existing
             } else {
                 val generated = generateRandomSecret()
+                // Старый (битый/другой) секрет — в историю, а не в мусор:
+                // Telegram мог сохранить ссылку именно с ним.
+                val prev = prefs[Keys.SECRET_KEY].orEmpty()
+                if (normalizeSecret(prev) != null) {
+                    prefs[Keys.SECRET_HISTORY] = pushHistory(prefs[Keys.SECRET_HISTORY].orEmpty(), prev)
+                }
                 prefs[Keys.SECRET_KEY] = generated
                 generated
             }
@@ -279,6 +306,10 @@ class SettingsStore(private val context: Context) {
             // останется старая ссылка («bad handshake»).
             val normalizedSecret = normalizeSecret(secretKey)
             if (normalizedSecret != null) {
+                val prev = normalizeSecret(it[Keys.SECRET_KEY].orEmpty())
+                if (prev != null && prev != normalizedSecret) {
+                    it[Keys.SECRET_HISTORY] = pushHistory(it[Keys.SECRET_HISTORY].orEmpty(), prev)
+                }
                 it[Keys.SECRET_KEY] = normalizedSecret
             }
         }

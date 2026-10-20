@@ -777,6 +777,17 @@ pub async fn ws_connect_once(
     ws_connect_once_full(dial_addr, domain, path, timeout, None, secure).await
 }
 
+/// То же, что ws_connect_once, но с явным выбором TLS (443) или plain (80).
+pub async fn ws_connect_secure(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+    secure: bool,
+) -> Result<RawWebSocket, WsError> {
+    ws_connect_once_full(dial_addr, domain, path, timeout, None, secure).await
+}
+
 pub async fn ws_connect_once_full(
     dial_addr: &str,
     domain: &str,

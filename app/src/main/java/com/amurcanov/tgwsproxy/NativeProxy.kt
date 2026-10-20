@@ -24,6 +24,7 @@ interface ProxyLibrary : Library {
     fun SetForceTestDc(v: Int)
     fun SetProxyProtocol(v: Int)
     fun GetSecretWithPrefix(): Pointer?
+    fun SetSecretHistory(secrets: String)
     fun GetActiveSecret(): Pointer?
     fun VerifyClientSecret(secret: String): Int
     fun GetStats(): Pointer?
@@ -116,6 +117,11 @@ object NativeProxy {
         val res = ptr.getString(0)
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
+    }
+
+    /** Недавние секреты (CSV): прокси принимает их наравне с активным. */
+    fun setSecretHistory(secrets: String) {
+        ProxyLibrary.INSTANCE.SetSecretHistory(secrets)
     }
 
     /** Секрет, с которым реально работает нативный прокси (32 hex). */

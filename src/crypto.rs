@@ -14,6 +14,8 @@ pub struct TrackedStream {
     iv: Vec<u8>,
     processed: u64,
     stream: Aes256Ctr,
+    /// Режим без шифрования: MTProto-proxy «simple» (секрет без префикса dd).
+    plain: bool,
 }
 
 impl TrackedStream {
@@ -24,16 +26,41 @@ impl TrackedStream {
             iv: iv.to_vec(),
             processed: 0,
             stream,
+            plain: false,
         }
+    }
+
+    /// Поток-заглушка для «simple» режима MTProto proxy: шифрования нет,
+    /// данные идут как есть (Telegram использует его, если в ссылке секрет
+    /// без префикса dd/ee).
+    pub fn new_plain() -> TrackedStream {
+        TrackedStream {
+            key: Vec::new(),
+            iv: Vec::new(),
+            processed: 0,
+            stream: Aes256Ctr::new(&[0u8; 32].into(), &[0u8; 16].into()),
+            plain: true,
+        }
+    }
+
+    pub fn is_plain(&self) -> bool {
+        self.plain
     }
 
     // XOR in place (dst == src в нашем использовании)
     pub fn xor(&mut self, data: &mut [u8]) {
+        if self.plain {
+            self.processed += data.len() as u64;
+            return;
+        }
         self.stream.apply_keystream(data);
         self.processed += data.len() as u64;
     }
 
     pub fn clone_state(&self) -> TrackedStream {
+        if self.plain {
+            return TrackedStream::new_plain();
+        }
         let mut clone_stream = Aes256Ctr::new(self.key.as_slice().into(), self.iv.as_slice().into());
         let mut dummy = [0u8; 16384];
         let mut rem = self.processed;
@@ -47,6 +74,7 @@ impl TrackedStream {
             iv: self.iv.clone(),
             processed: self.processed,
             stream: clone_stream,
+            plain: false,
         }
     }
 }

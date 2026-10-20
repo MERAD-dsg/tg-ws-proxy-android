@@ -36,6 +36,7 @@ object ProxyController {
         val dpiBypassEnabled = settingsStore.dpiBypassEnabled.first()
         val upstreamProxyUrl = settingsStore.upstreamProxyUrl.first().trim()
         val secretKey = ensureSecretKey(settingsStore)
+        val secretHistory = settingsStore.secretHistory.first().trim()
 
         val parsedIps = buildList {
             if (!isDcAuto) {
@@ -79,6 +80,7 @@ object ProxyController {
                 putExtra(ProxyService.EXTRA_DPI_BYPASS, dpiBypassEnabled)
                 putExtra(ProxyService.EXTRA_UPSTREAM_PROXY, upstreamProxyUrl)
                 putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
+                putExtra(ProxyService.EXTRA_SECRET_HISTORY, secretHistory)
             }
         )
         ProxyTileService.requestSync(context)

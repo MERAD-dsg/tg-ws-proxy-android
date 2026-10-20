@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,11 @@ pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
 // proxy/config.py::ProxyConfig — мобильные эквиваленты
-pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+// По умолчанию используем TLS (443). Раньше здесь стоял `true`, из-за чего
+// ВСЕ соединения (CF-домены, воркеры, прямой WS) шли на порт 80 — на
+// мобильных сетях он часто заблокирован, и в логах был сплошной
+// «CF fail ...: timeout» по всем доменам сразу.
+pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(false);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
@@ -348,6 +352,92 @@ pub fn sanitize_secret(raw: &str) -> Option<String> {
         Some(secret.to_string())
     } else {
         None
+    }
+}
+
+/// Недавние секреты (например, предыдущий секрет, пока в Telegram осталась
+/// старая ссылка). Прокси принимает их наравне с активным — это убирает
+/// «bad handshake» после смены секрета без переприменения ссылки.
+pub static SECRET_HISTORY: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(Vec::new()));
+
+/// Все секреты, которые принимает прокси: активный + история.
+/// Возвращает (секрет, байты).
+pub fn secret_candidates() -> Vec<(String, Vec<u8>)> {
+    let active = PROXY_SECRET.read().clone();
+    let mut list: Vec<String> = vec![active.clone()];
+    for s in SECRET_HISTORY.read().iter() {
+        if !list.contains(s) {
+            list.push(s.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for s in list {
+        if let Some(normalized) = sanitize_secret(&s) {
+            if let Ok(bytes) = hex::decode(&normalized) {
+                if bytes.len() == 16 {
+                    out.push((normalized, bytes));
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Circuit breaker для маршрута Cloudflare
+//
+// Если все CF-домены подряд отваливаются по таймауту (типичная картина при
+// блокировке Cloudflare у провайдера), нет смысла на каждом соединении ждать
+// по 5 секунд на домен: маршрут временно отключается целиком.
+// ---------------------------------------------------------------------------
+
+pub static CF_CONSECUTIVE_FAILS: AtomicU32 = AtomicU32::new(0);
+pub static CF_CIRCUIT_OPEN_UNTIL: AtomicU64 = AtomicU64::new(0);
+pub const CF_CIRCUIT_FAIL_THRESHOLD: u32 = 3;
+pub const CF_CIRCUIT_OPEN_SECS: u64 = 45;
+
+pub fn cf_circuit_open() -> bool {
+    let until = CF_CIRCUIT_OPEN_UNTIL.load(Ordering::Relaxed);
+    until > 0 && (now_unix() as u64) < until
+}
+
+pub fn cf_circuit_note_success() {
+    CF_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+    CF_CIRCUIT_OPEN_UNTIL.store(0, Ordering::Relaxed);
+}
+
+pub fn cf_circuit_note_failure() {
+    let n = CF_CONSECUTIVE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= CF_CIRCUIT_FAIL_THRESHOLD {
+        let was_open = cf_circuit_open();
+        CF_CIRCUIT_OPEN_UNTIL
+            .store(now_unix() as u64 + CF_CIRCUIT_OPEN_SECS, Ordering::Relaxed);
+        CF_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+        if !was_open {
+            lwarn!(
+                " CF: маршрут Cloudflare временно отключён на {}с ({} неудач подряд)",
+                CF_CIRCUIT_OPEN_SECS,
+                n
+            );
+        }
+    }
+}
+
+/// Сколько раз в текущем окне маршрут Cloudflare был пропущен (для логов).
+pub static CF_SKIPPED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Дедупликация INFO-логов, которые иначе повторяются на каждом соединении.
+pub fn log_once_per(key: &str, window_secs: u64) -> bool {
+    use std::collections::HashMap;
+    static SEEN: Lazy<RwLock<HashMap<String, i64>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+    let now = now_unix();
+    let mut map = SEEN.write();
+    let last = map.get(key).copied().unwrap_or(0);
+    if now - last >= window_secs as i64 {
+        map.insert(key.to_string(), now);
+        true
+    } else {
+        false
     }
 }
 

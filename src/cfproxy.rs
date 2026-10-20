@@ -668,26 +668,48 @@ pub async fn cf_connect_domain(
         phase_timeout = CFPROXY_DIAL_PHASE_TIMEOUT;
     }
 
-    let host_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-    match ws_connect_once(domain, domain, path, host_timeout).await {
-        Ok(ws) => return (Some(ws), String::new(), None),
-        Err(host_err) => {
-            if is_http_status_error(&host_err, 429) {
-                return (None, String::new(), Some(host_err));
+    // Порт выбираем перебором: 443 (wss) -> 80 (ws). Раньше порт жёстко
+    // зависел от одной настройки, и если провайдер режет выбранный порт,
+    // ВСЕ домены одновременно «умирали» по таймауту.
+    let mut resolved_ip = String::new();
+    let mut last_err: Option<WsError> = None;
+    let mut last_was_429 = false;
+
+    for secure in [true, false] {
+        let host_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
+        match ws_connect_secure(domain, domain, path, host_timeout, secure).await {
+            Ok(ws) => return (Some(ws), String::new(), None),
+            Err(host_err) => {
+                if is_http_status_error(&host_err, 429) {
+                    return (None, String::new(), Some(host_err));
+                }
+                last_was_429 = false;
+                last_err = Some(host_err);
             }
-            let resolved_ip = resolve_doh(domain).await.unwrap_or_default();
+        }
+
+        if resolved_ip.is_empty() {
+            resolved_ip = resolve_doh(domain).await.unwrap_or_default();
             if resolved_ip.is_empty() {
                 ldebug!(" CF DNS {} -> no result", domain);
-                return (None, String::new(), Some(host_err));
+                continue;
             }
             ldebug!(" CF DNS {} -> {}", domain, resolved_ip);
-            let ip_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-            match ws_connect_once(&resolved_ip, domain, path, ip_timeout).await {
-                Ok(ws) => (Some(ws), resolved_ip, None),
-                Err(e) => (None, resolved_ip, Some(e)),
+        }
+
+        let ip_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
+        match ws_connect_secure(&resolved_ip, domain, path, ip_timeout, secure).await {
+            Ok(ws) => return (Some(ws), resolved_ip, None),
+            Err(e) => {
+                if is_http_status_error(&e, 429) {
+                    return (None, resolved_ip, Some(e));
+                }
+                last_err = Some(e);
             }
         }
     }
+    let _ = last_was_429;
+    (None, resolved_ip, last_err)
 }
 
 pub fn log_cf_conn_error(msg: &str, err: &WsError) {

@@ -427,6 +427,35 @@ pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
     }
 }
 
+/// Недавние секреты (CSV): прокси принимает их наравне с активным.
+///
+/// Нужно для случая, когда пользователь сменил секрет в приложении, но в
+/// Telegram осталась ссылка со старым — иначе Telegram получает «bad
+/// handshake» и заваливает прокси переподключениями.
+///
+/// # Safety
+/// `c_secrets` — валидная C-строка или null (через запятую/пробел).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetSecretHistory(c_secrets: *const c_char) {
+    let raw = cstr_to_string(c_secrets);
+    let mut list: Vec<String> = Vec::new();
+    for item in raw
+        .replace(',', " ")
+        .replace(';', " ")
+        .split_whitespace()
+    {
+        if let Some(s) = sanitize_secret(item) {
+            if !list.contains(&s) {
+                list.push(s);
+            }
+        }
+    }
+    if !list.is_empty() {
+        ldebug!(" SetSecretHistory: {} секрет(ов) в истории", list.len());
+    }
+    *SECRET_HISTORY.write() = list;
+}
+
 /// Активный секрет, с которым реально работает прокси (32 hex).
 /// Нужен UI, чтобы ссылка и настройки всегда совпадали с нативным состоянием.
 #[unsafe(no_mangle)]
@@ -445,8 +474,9 @@ pub unsafe extern "C" fn VerifyClientSecret(c_secret: *const c_char) -> c_int {
     let raw = cstr_to_string(c_secret);
     match sanitize_secret(&raw) {
         Some(v) => {
-            let active = PROXY_SECRET.read().clone();
-            if v == active {
+            // Совпадением считается и активный секрет, и любой из недавних:
+            // прокси принимает их все, значит ссылка рабочая.
+            if secret_candidates().iter().any(|(s, _)| *s == v) {
                 1
             } else {
                 0

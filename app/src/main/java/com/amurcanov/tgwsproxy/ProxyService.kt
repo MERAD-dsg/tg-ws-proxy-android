@@ -46,6 +46,7 @@ class ProxyService : Service() {
     private var lastDpiBypass: Boolean = true
     private var lastUpstreamProxy: String = ""
     private var lastSecretKey: String = ""
+    private var lastSecretHistory: String = ""
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -63,6 +64,7 @@ class ProxyService : Service() {
         const val EXTRA_DPI_BYPASS = "EXTRA_DPI_BYPASS"
         const val EXTRA_UPSTREAM_PROXY = "EXTRA_UPSTREAM_PROXY"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
+        const val EXTRA_SECRET_HISTORY = "EXTRA_SECRET_HISTORY"
         
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -104,8 +106,9 @@ class ProxyService : Service() {
                 val dpiBypass = intent.getBooleanExtra(EXTRA_DPI_BYPASS, true)
                 val upstreamProxy = intent.getStringExtra(EXTRA_UPSTREAM_PROXY) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
+                val secretHistory = intent.getStringExtra(EXTRA_SECRET_HISTORY) ?: ""
                 startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain,
-                    cfExtraUrls, dpiBypass, upstreamProxy, secretKey, cfWorkerDomains)
+                    cfExtraUrls, dpiBypass, upstreamProxy, secretKey, cfWorkerDomains, secretHistory)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -119,7 +122,8 @@ class ProxyService : Service() {
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
                     startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain,
-                        lastCfExtraUrls, lastDpiBypass, lastUpstreamProxy, lastSecretKey, lastCfWorkerDomains)
+                        lastCfExtraUrls, lastDpiBypass, lastUpstreamProxy, lastSecretKey, lastCfWorkerDomains,
+                        lastSecretHistory)
                 } else {
                     stopSelf()
                 }
@@ -148,7 +152,8 @@ class ProxyService : Service() {
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
                            cfDomain: String = "", cfExtraUrls: String = "",
                            dpiBypass: Boolean = true, upstreamProxy: String = "",
-                           secretKey: String = "", cfWorkerDomains: String = "") {
+                           secretKey: String = "", cfWorkerDomains: String = "",
+                           secretHistory: String = "") {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -165,6 +170,7 @@ class ProxyService : Service() {
         lastDpiBypass = dpiBypass
         lastUpstreamProxy = upstreamProxy
         lastSecretKey = secretKey
+        lastSecretHistory = secretHistory
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
@@ -204,6 +210,7 @@ class ProxyService : Service() {
                 NativeProxy.setCfWorkerDomains(cfWorkerDomains.trim())
                 NativeProxy.setUpstreamProxy(upstreamProxy.trim())
                 NativeProxy.setDpiBypass(dpiBypass)
+                NativeProxy.setSecretHistory(secretHistory.trim())
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
                     // Самоисцеление секрета: ссылка в Telegram должна совпадать
@@ -351,7 +358,8 @@ class ProxyService : Service() {
                 dpiBypass = lastDpiBypass,
                 upstreamProxy = lastUpstreamProxy,
                 secretKey = lastSecretKey,
-                cfWorkerDomains = lastCfWorkerDomains
+                cfWorkerDomains = lastCfWorkerDomains,
+                secretHistory = lastSecretHistory
             )
         }
     }
