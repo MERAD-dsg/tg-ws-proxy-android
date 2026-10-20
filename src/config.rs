@@ -329,6 +329,10 @@ pub fn sanitize_secret(raw: &str) -> Option<String> {
     if s.is_empty() {
         return None;
     }
+    // Секрет — только ASCII: иначе срез по байтам ниже мог бы запаниковать.
+    if !s.is_ascii() {
+        return None;
+    }
     let lower = s.to_ascii_lowercase();
     // Полный секрет из ссылки Telegram: dd/ee + сам секрет (+ домен для ee).
     let body = if lower.len() > 32 && (lower.starts_with("dd") || lower.starts_with("ee")) {
@@ -831,4 +835,46 @@ pub fn now_monotonic() -> f64 {
     use std::time::Instant;
     static START: Lazy<Instant> = Lazy::new(Instant::now);
     START.elapsed().as_secs_f64()
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_accepts_plain_and_link_forms() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        assert_eq!(sanitize_secret(hex).unwrap(), hex);
+        // полный секрет из ссылки Telegram
+        assert_eq!(sanitize_secret(&format!("dd{}", hex)).unwrap(), hex);
+        // ee-секрет содержит домен после самого секрета
+        assert_eq!(
+            sanitize_secret(&format!("ee{}6b77732e6d65", hex)).unwrap(),
+            hex
+        );
+        // верхний регистр и пробелы нормализуются
+        assert_eq!(
+            sanitize_secret(&format!("  {}  ", hex.to_uppercase())).unwrap(),
+            hex
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_garbage() {
+        assert!(sanitize_secret("").is_none());
+        assert!(sanitize_secret("0000").is_none());
+        assert!(sanitize_secret("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+        // 32 символа, но не hex
+        assert!(sanitize_secret("0123456789abcdef0123456789abcdeg").is_none());
+        // не-ASCII (срез по байтам не должен паниковать)
+        assert!(sanitize_secret("секрет-секрет-секрет-секрет-секр").is_none());
+    }
+
+    #[test]
+    fn bad_handshake_log_is_rate_limited() {
+        // окно 0 секунд — каждое сообщение считается «первым в окне»
+        assert!(bad_handshake_log_gate(0).is_some());
+        // окно 60 секунд — повтор сразу после первого подавляется
+        assert!(bad_handshake_log_gate(60).is_none());
+    }
 }
