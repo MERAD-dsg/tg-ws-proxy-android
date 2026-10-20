@@ -731,8 +731,8 @@ mod tests {
             "my-proxy.example.com"
         );
         assert_eq!(
-            canonicalize_pool_entry("DONT-BLOCK-IT.UK").unwrap(),
-            "my-proxy.example.com"
+            canonicalize_pool_entry("EXAMPLE.ORG").unwrap(),
+            "example.org"
         );
         assert!(canonicalize_pool_entry("not a domain!!").is_none());
         assert!(canonicalize_pool_entry("").is_none());
