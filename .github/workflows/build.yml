@@ -56,7 +56,9 @@ jobs:
           link-to-sdk: false
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
 
       - uses: Swatinem/rust-cache@v2
 
