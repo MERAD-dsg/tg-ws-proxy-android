@@ -1,5 +1,5 @@
 use crate::config::*;
-use crate::ws::{is_http_status_error, ws_connect_once, RawWebSocket, WsError};
+use crate::ws::{is_http_status_error, ws_connect_once, ws_connect_secure, RawWebSocket, WsError};
 use crate::{ldebug, lerror, linfo, lwarn};
 use serde::Deserialize;
 use std::path::PathBuf;

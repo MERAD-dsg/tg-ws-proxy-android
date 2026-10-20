@@ -414,11 +414,10 @@ pub fn cf_circuit_note_failure() {
             .store(now_unix() as u64 + CF_CIRCUIT_OPEN_SECS, Ordering::Relaxed);
         CF_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
         if !was_open {
-            lwarn!(
+            log_warn(&format!(
                 " CF: маршрут Cloudflare временно отключён на {}с ({} неудач подряд)",
-                CF_CIRCUIT_OPEN_SECS,
-                n
-            );
+                CF_CIRCUIT_OPEN_SECS, n
+            ));
         }
     }
 }

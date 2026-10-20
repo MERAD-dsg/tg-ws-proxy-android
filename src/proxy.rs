@@ -2029,10 +2029,10 @@ async fn serve_core<R, W>(
     );
 
     let mut relay_init = [0u8; 64];
-    let mut clt_decryptor;
-    let mut clt_encryptor;
-    let mut tg_encryptor;
-    let mut tg_decryptor;
+    let clt_decryptor;
+    let clt_encryptor;
+    let tg_encryptor;
+    let tg_decryptor;
 
     if plain_mode {
         // simple-режим: заголовок клиента уходит в DC как есть, шифрования нет.
@@ -2062,7 +2062,7 @@ async fn serve_core<R, W>(
             tg_dec_prekey_and_iv[i] = relay_init[8 + 47 - i];
         }
 
-        tg_encryptor = new_aes_ctr(&relay_init[8..40], &relay_init[40..56]);
+        let mut enc = new_aes_ctr(&relay_init[8..40], &relay_init[40..56]);
         tg_decryptor = new_aes_ctr(&tg_dec_prekey_and_iv[..32], &tg_dec_prekey_and_iv[32..]);
 
         let mut dc_bytes = [0u8; 2];
@@ -2074,7 +2074,8 @@ async fn serve_core<R, W>(
         rand::thread_rng().fill_bytes(&mut tail_plain[6..8]);
 
         let mut encrypted_full = relay_init;
-        tg_encryptor.xor(&mut encrypted_full);
+        enc.xor(&mut encrypted_full);
+        tg_encryptor = enc;
 
         let mut keystream_tail = [0u8; 8];
         for i in 0..8 {
@@ -2087,9 +2088,10 @@ async fn serve_core<R, W>(
         let mut hash_dec = Sha256::new();
         hash_dec.update(clt_dec_prekey);
         hash_dec.update(&effective_secret);
-        clt_decryptor = new_aes_ctr(&hash_dec.finalize(), clt_dec_iv);
+        let mut decryptor = new_aes_ctr(&hash_dec.finalize(), clt_dec_iv);
         let mut scratch = [0u8; 64];
-        clt_decryptor.xor(&mut scratch);
+        decryptor.xor(&mut scratch);
+        clt_decryptor = decryptor;
 
         // clt_encryptor: prekey/iv = reverse(client_dec_prekey_iv), key=SHA256+secret.
         let mut clt_enc_prekey_and_iv = [0u8; 48];
