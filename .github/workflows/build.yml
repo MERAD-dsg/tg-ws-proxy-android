@@ -21,7 +21,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test
-        run: cargo test --lib
+        run: |
+          set +e
+          cargo test --lib 2>&1 | tee cargo-out.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "===== BUILD OUTPUT TAIL ====="
+            tail -n 200 cargo-out.txt
+            # emit as annotations so failures are visible via the Checks API
+            tail -n 200 cargo-out.txt | fold -w 3500 | head -40 | while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              echo "::error::${line}"
+            done
+            exit "$code"
+          fi
 
   build-android:
     name: Native libs + APK
@@ -65,8 +78,17 @@ jobs:
 
       - name: Build release APKs
         run: |
+          set +e
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee gradle-out.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            tail -n 200 gradle-out.txt | fold -w 3500 | head -40 | while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              echo "::error::${line}"
+            done
+            exit "$code"
+          fi
 
       - name: Collect artifacts
         run: |
