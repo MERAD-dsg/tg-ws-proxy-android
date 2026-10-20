@@ -118,6 +118,9 @@
     <string name="nav_logs">Logs</string>
     <string name="invalid_port">Invalid port</string>
     <string name="notification_starting">Starting proxy...</string>
+    <string name="route_check">Check routes</string>
+    <string name="route_check_running">Checking…</string>
+    <string name="route_check_hint">Tests direct WS, your own Cloudflare Worker and the CF domain pool, and shows which route actually works on your network. Details go to the log.</string>
     <string name="notification_bad_secret">Invalid proxy secret (32 hex characters required). Restart the proxy from the app</string>
     <string name="secret_verified_ok">Secret matches the active proxy</string>
     <string name="secret_verified_mismatch">Secret does NOT match the active proxy — apply the Telegram link again</string>

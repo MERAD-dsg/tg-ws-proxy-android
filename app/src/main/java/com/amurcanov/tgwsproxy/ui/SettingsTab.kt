@@ -145,6 +145,10 @@ fun SettingsTab(settingsStore: SettingsStore) {
     // Статус проверки секрета (кнопка «Проверить»): совпадает ли он с тем,
     // с которым реально работает запущенный прокси.
     var secretCheckResult by remember { mutableStateOf<Int?>(null) }
+
+    // Диагностика маршрутов: какой путь до Telegram реально проходит на этой сети.
+    var diagRunning by remember { mutableStateOf(false) }
+    var diagResult by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(isRunning, secretKeyText) {
         // при смене состояния перезапуска/секрета сбрасываем прошлый результат
         secretCheckResult = null
@@ -167,6 +171,24 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 cfWorkerDomains
             )
         }
+    }
+
+    diagResult?.let { result ->
+        AlertDialog(
+            onDismissRequest = { diagResult = null },
+            title = { Text(stringResource(com.amurcanov.tgwsproxy.R.string.route_check)) },
+            text = {
+                Text(
+                    text = result,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { diagResult = null }) {
+                    Text(stringResource(android.R.string.ok))
+                }
+            }
+        )
     }
 
     var showIpSetupDialog by rememberSaveable { mutableStateOf(false) }
@@ -561,6 +583,40 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     )
                     Text(
                         stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_domains_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    OutlinedButton(
+                        onClick = {
+                            if (!diagRunning) {
+                                diagRunning = true
+                                diagResult = null
+                                // Проверка ходит в сеть (до 6 с на маршрут) —
+                                // только в фоне, иначе UI подвиснет.
+                                Thread {
+                                    val res = runCatching {
+                                        NativeProxy.diagnoseRoutes(2)
+                                    }.getOrElse { "ошибка: ${it.message}" }
+                                    scope.launch {
+                                        diagResult = res
+                                        diagRunning = false
+                                    }
+                                }.apply { isDaemon = true }.start()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Text(
+                            stringResource(
+                                if (diagRunning) com.amurcanov.tgwsproxy.R.string.route_check_running
+                                else com.amurcanov.tgwsproxy.R.string.route_check
+                            )
+                        )
+                    }
+                    Text(
+                        stringResource(com.amurcanov.tgwsproxy.R.string.route_check_hint),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

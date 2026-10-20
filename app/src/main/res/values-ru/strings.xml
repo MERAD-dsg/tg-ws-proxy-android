@@ -118,6 +118,9 @@
     <string name="nav_logs">Логи</string>
     <string name="invalid_port">Неверный порт</string>
     <string name="notification_starting">Запуск прокси...</string>
+    <string name="route_check">Проверить маршруты</string>
+    <string name="route_check_running">Проверяю…</string>
+    <string name="route_check_hint">Проверяет прямой WS, свой Cloudflare Worker и пул CF-доменов и показывает, какой маршрут проходит именно на вашей сети. Подробности — в журнале.</string>
     <string name="notification_bad_secret">Некорректный секрет прокси (нужно 32 hex-символа). Перезапустите прокси из приложения</string>
     <string name="secret_verified_ok">Секрет совпадает с активным прокси</string>
     <string name="secret_verified_mismatch">Секрет НЕ совпадает с активным прокси — нажмите «Применить в Telegram» заново</string>

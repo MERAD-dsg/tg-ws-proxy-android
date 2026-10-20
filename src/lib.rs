@@ -16,6 +16,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
@@ -425,6 +426,83 @@ pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
         Some(v) => *PROXY_SECRET.write() = v,
         None => lwarn!("SetSecret: некорректный секрет проигнорирован"),
     }
+}
+
+/// Диагностика маршрутов: пробует прямой WS, свой Cloudflare Worker и
+/// первую пару CF-доменов, пишет результат в лог и возвращает сводку.
+///
+/// Нужна, когда «прокси запущен, а Telegram не подключается»: сразу видно,
+/// какой маршрут на этой сети вообще проходит.
+#[unsafe(no_mangle)]
+pub extern "C" fn DiagnoseRoutes(dc: c_int) -> *mut c_char {
+    let dc = if dc <= 0 { 2 } else { dc };
+    let out = runtime().block_on(async move {
+        let probe_timeout = Duration::from_secs(6);
+        let mut parts: Vec<String> = Vec::new();
+
+        // 1) Прямой WS к kws{dc}.web.telegram.org
+        let mut direct = "skip".to_string();
+        for d in crate::proxy::ws_domains(dc, false) {
+            match crate::ws::ws_connect_secure(&d, &d, WS_PATH, probe_timeout, true).await {
+                Ok(ws) => {
+                    ws.close().await;
+                    direct = format!("ok ({})", d);
+                    break;
+                }
+                Err(e) => direct = format!("{} ({})", e.compact(), d),
+            }
+        }
+        linfo!(" диагностика: прямой WS -> {}", direct);
+        parts.push(format!("direct={}", direct));
+
+        // 2) Свой Cloudflare Worker
+        let workers = CF_WORKER_DOMAINS.read().clone();
+        if workers.is_empty() {
+            linfo!(" диагностика: свой worker не настроен");
+            parts.push("worker=не настроен".to_string());
+        } else {
+            let dst = crate::proxy::resolve_fallback_target(dc, false, false);
+            let path = format!("/apiws?dst={}&dc={}", dst, dc);
+            let mut res = "нет".to_string();
+            for w in workers.iter().take(2) {
+                match crate::ws::ws_connect_secure(w, w, &path, probe_timeout, true).await {
+                    Ok(ws) => {
+                        ws.close().await;
+                        res = format!("ok ({})", w);
+                        break;
+                    }
+                    Err(e) => res = format!("{} ({})", e.compact(), w),
+                }
+            }
+            linfo!(" диагностика: свой worker -> {}", res);
+            parts.push(format!("worker={}", res));
+        }
+
+        // 3) Пул CF-доменов (первые два)
+        let cf_domains: Vec<String> = CFPROXY.read().domains.iter().take(2).cloned().collect();
+        if cf_domains.is_empty() {
+            parts.push("cf=пул пуст".to_string());
+        } else {
+            let mut res = "нет".to_string();
+            for base in cf_domains {
+                let host = format!("kws{}.{}", dc, base);
+                match crate::ws::ws_connect_secure(&host, &host, WS_PATH, probe_timeout, true).await
+                {
+                    Ok(ws) => {
+                        ws.close().await;
+                        res = format!("ok ({})", host);
+                        break;
+                    }
+                    Err(e) => res = format!("{} ({})", e.compact(), host),
+                }
+            }
+            linfo!(" диагностика: пул CF -> {}", res);
+            parts.push(format!("cf={}", res));
+        }
+
+        parts.join("; ")
+    });
+    CString::new(out).unwrap_or_default().into_raw()
 }
 
 /// Недавние секреты (CSV): прокси принимает их наравне с активным.

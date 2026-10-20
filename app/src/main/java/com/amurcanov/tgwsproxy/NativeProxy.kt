@@ -25,6 +25,7 @@ interface ProxyLibrary : Library {
     fun SetProxyProtocol(v: Int)
     fun GetSecretWithPrefix(): Pointer?
     fun SetSecretHistory(secrets: String)
+    fun DiagnoseRoutes(dc: Int): Pointer?
     fun GetActiveSecret(): Pointer?
     fun VerifyClientSecret(secret: String): Int
     fun GetStats(): Pointer?
@@ -122,6 +123,17 @@ object NativeProxy {
     /** Недавние секреты (CSV): прокси принимает их наравне с активным. */
     fun setSecretHistory(secrets: String) {
         ProxyLibrary.INSTANCE.SetSecretHistory(secrets)
+    }
+
+    /**
+     * Проверка маршрутов (прямой WS / свой worker / пул CF).
+     * Возвращает короткую сводку; подробности пишутся в лог.
+     */
+    fun diagnoseRoutes(dc: Int = 2): String? {
+        val ptr = ProxyLibrary.INSTANCE.DiagnoseRoutes(dc) ?: return null
+        val res = ptr.getString(0)
+        ProxyLibrary.INSTANCE.FreeString(ptr)
+        return res
     }
 
     /** Секрет, с которым реально работает нативный прокси (32 hex). */
