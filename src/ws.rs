@@ -1,5 +1,6 @@
 use crate::config::*;
 use crate::crypto::xor_mask_in_place;
+use crate::net::FragmentingStream;
 use crate::{ldebug};
 use base64::Engine;
 use byteorder::{BigEndian, ByteOrder};
@@ -178,13 +179,13 @@ impl From<std::io::Error> for WsError {
 // ---------------------------------------------------------------------------
 
 enum WsReader {
-    Tls(BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>),
-    Plain(BufReader<tokio::io::ReadHalf<TcpStream>>),
+    Tls(BufReader<tokio::io::ReadHalf<TlsStream<FragmentingStream>>>),
+    Plain(BufReader<tokio::io::ReadHalf<FragmentingStream>>),
 }
 
 enum WsWriter {
-    Tls(tokio::io::WriteHalf<TlsStream<TcpStream>>),
-    Plain(tokio::io::WriteHalf<TcpStream>),
+    Tls(tokio::io::WriteHalf<TlsStream<FragmentingStream>>),
+    Plain(tokio::io::WriteHalf<FragmentingStream>),
 }
 
 pub struct RawWebSocket {
@@ -613,8 +614,8 @@ fn server_name(domain: &str) -> ServerName<'static> {
 
 // Типизированный handshake: возвращает готовый RawWebSocket без type-erasure.
 async fn handshake_tls(
-    read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
-    mut write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    read_half: tokio::io::ReadHalf<TlsStream<FragmentingStream>>,
+    mut write_half: tokio::io::WriteHalf<TlsStream<FragmentingStream>>,
     domain: &str,
     path: &str,
     timeout: Duration,
@@ -653,8 +654,8 @@ async fn handshake_tls(
 }
 
 async fn handshake_plain(
-    read_half: tokio::io::ReadHalf<TcpStream>,
-    mut write_half: tokio::io::WriteHalf<TcpStream>,
+    read_half: tokio::io::ReadHalf<FragmentingStream>,
+    mut write_half: tokio::io::WriteHalf<FragmentingStream>,
     domain: &str,
     path: &str,
     timeout: Duration,
@@ -794,12 +795,20 @@ pub async fn ws_connect_once_full(
         format!("{}:80", dial_addr)
     };
 
-    let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(WsError::Io(e)),
-        Err(_) => return Err(WsError::Timeout),
+    // Исходящее соединение: напрямую либо через SOCKS5/HTTP-апстрим
+    // (например, SOCKS5-шлюз поверх Cloudflare WARP — без VpnService).
+    let raw_conn = match crate::net::outbound_tcp(&target_addr, timeout).await {
+        Ok(c) => c,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                return Err(WsError::Timeout);
+            }
+            return Err(WsError::Io(e));
+        }
     };
     set_sock_opts(&raw_conn);
+    // Обход DPI: фрагментация первого сегмента (TLS ClientHello / HTTP).
+    let raw_conn = FragmentingStream::wrap(raw_conn);
 
     if !secure {
         let (read_half, write_half) = tokio::io::split(raw_conn);

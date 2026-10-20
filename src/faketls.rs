@@ -384,14 +384,14 @@ pub async fn server_handshake(
 }
 
 async fn proxy_to_masking_domain(conn: TcpStream, initial: Vec<u8>, domain: &str, label: &str) {
-    let upstream = match tokio::time::timeout(
+    let upstream = match crate::net::outbound_tcp(
+        &format!("{}:443", domain),
         MASKING_CONNECT_TIMEOUT,
-        TcpStream::connect((domain, 443u16)),
     )
     .await
     {
-        Ok(Ok(s)) => s,
-        _ => {
+        Ok(s) => s,
+        Err(_) => {
             log_warn(&format!(
                 "[{}] masking: cannot connect to {}:443",
                 label, domain

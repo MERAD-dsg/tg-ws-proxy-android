@@ -15,6 +15,9 @@ interface ProxyLibrary : Library {
     fun SetBufferSizeKb(kb: Int)
     fun SetCfProxyCacheDir(cacheDir: String)
     fun SetCfProxyConfig(enabled: Int, priority: Int, userDomain: String)
+    fun SetCfProxyExtraUrls(urls: String)
+    fun SetUpstreamProxy(url: String)
+    fun SetDpiBypass(enabled: Int, fragSize: Int, fragDelayMs: Int)
     fun SetCfWorkerDomains(domains: String)
     fun SetFakeTlsDomain(domain: String)
     fun SetDisableSecure(v: Int)
@@ -22,6 +25,7 @@ interface ProxyLibrary : Library {
     fun SetProxyProtocol(v: Int)
     fun GetSecretWithPrefix(): Pointer?
     fun GetStats(): Pointer?
+    fun GetDomainsSummary(): Pointer?
     fun FreeString(p: Pointer)
 }
 
@@ -52,6 +56,36 @@ object NativeProxy {
             if (priority) 1 else 0,
             userDomain
         )
+    }
+
+    /** Extra plain-text domain list URLs (comma/semicolon/space separated). */
+    fun setCfProxyExtraUrls(urls: String) {
+        ProxyLibrary.INSTANCE.SetCfProxyExtraUrls(urls)
+    }
+
+    /**
+     * Outbound SOCKS5/HTTP upstream for all proxy connections
+     * (e.g. a SOCKS5 gateway in front of Cloudflare WARP). Empty = direct.
+     */
+    fun setUpstreamProxy(url: String) {
+        ProxyLibrary.INSTANCE.SetUpstreamProxy(url)
+    }
+
+    /** DPI bypass: split the first TLS segment (ClientHello fragmentation). */
+    fun setDpiBypass(enabled: Boolean, fragSize: Int = 1, fragDelayMs: Int = 25) {
+        ProxyLibrary.INSTANCE.SetDpiBypass(
+            if (enabled) 1 else 0,
+            fragSize,
+            fragDelayMs
+        )
+    }
+
+    /** Diagnostics summary of the CF domain pool. */
+    fun getDomainsSummary(): String? {
+        val ptr = ProxyLibrary.INSTANCE.GetDomainsSummary() ?: return null
+        val res = ptr.getString(0)
+        ProxyLibrary.INSTANCE.FreeString(ptr)
+        return res
     }
 
     fun setCfWorkerDomains(domains: String) {

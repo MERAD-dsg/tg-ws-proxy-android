@@ -2,6 +2,7 @@ pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
+pub mod net;
 pub mod proxy;
 pub mod ws;
 pub mod balancer;
@@ -105,6 +106,10 @@ pub unsafe extern "C" fn StartProxy(
     let cancel_root = cancel_tasks.clone();
 
     let handle = rt.spawn(async move {
+        // Фоновое обновление пула доменов (GitHub + зеркала + пользовательские
+        // URL). Раньше оно не запускалось вовсе — пул устаревал и «умирал».
+        cfproxy::start_cfproxy_refresh();
+
         // Предварительный bind для сигнала готовности
         let addr = format!("{}:{}", host_task, go_port);
         match tokio::net::TcpListener::bind(&addr).await {
@@ -227,17 +232,127 @@ pub unsafe extern "C" fn SetCfProxyConfig(
 ) {
     CFPROXY_ENABLED.store(enabled != 0, Ordering::Relaxed);
     let user_domain = cstr_to_string(c_user_domain);
-    // Поддержка нескольких доменов как --cfproxy-domain (repeatable).
+    // Пользовательские домены используются КАК ЕСТЬ (dont-block-it.uk и т.п.),
+    // без decode .com -> .co.uk и без требования суффикса .co.uk.
     let list = coerce_domain_list_str(&user_domain);
+    let user_domains = crate::cfproxy::merge_user_domains(&[list]);
     let mut cfg = CFPROXY.write();
     cfg.user_domain = user_domain.trim().to_string();
-    if !list.is_empty() {
-        cfg.domains = list.clone();
-        cfg.active = list[0].clone();
+    cfg.user_domains = user_domains.clone();
+    if !user_domains.is_empty() {
+        // Приоритет пользователя: его домены идут первыми, авто-пул — запасной.
+        let mut domains = user_domains.clone();
+        for d in cfg.domains.iter() {
+            if !domains.contains(d) {
+                domains.push(d.clone());
+            }
+        }
+        cfg.domains = domains.clone();
+        cfg.active = user_domains[0].clone();
         crate::balancer::BALANCER
             .write()
-            .update_domains_list(&cfg.domains);
+            .update_domains_list_with_priority(user_domains.len(), &domains);
+        linfo!(
+            " CF: пользовательские домены заданы ({}): {:?}",
+            user_domains.len(),
+            user_domains
+        );
     }
+}
+
+/// # Safety
+/// `c_urls` — валидная C-строка или null: URL списков доменов через , ; пробел.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetCfProxyExtraUrls(c_urls: *const c_char) {
+    let raw = cstr_to_string(c_urls);
+    let urls: Vec<String> = raw
+        .replace(',', " ")
+        .replace(';', " ")
+        .split_whitespace()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        .collect();
+    *CFPROXY_EXTRA_URLS.write() = urls;
+}
+
+/// # Safety
+/// `c_url` — валидная C-строка или null: `socks5://user:pass@host:port`
+/// или `http://host:port`. Пусто — прямые соединения.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetUpstreamProxy(c_url: *const c_char) {
+    let url = cstr_to_string(c_url);
+    let url = url.trim().to_string();
+    if !url.is_empty() {
+        match crate::net::parse_upstream_url(&url) {
+            Ok(p) => {
+                linfo!(
+                    " upstream proxy: {:?}://{}:{} (auth={})",
+                    p.kind,
+                    p.host,
+                    p.port,
+                    if p.username.is_empty() { "no" } else { "yes" }
+                );
+            }
+            Err(e) => {
+                lwarn!(" upstream proxy url ignored: {}", e);
+                return;
+            }
+        }
+    }
+    *UPSTREAM_PROXY_URL.write() = url;
+}
+
+/// Обход DPI: фрагментация первого TCP-сегмента (TLS ClientHello).
+#[unsafe(no_mangle)]
+pub extern "C" fn SetDpiBypass(enabled: c_int, frag_size: c_int, frag_delay_ms: c_int) {
+    DPI_BYPASS_ENABLED.store(enabled != 0, Ordering::Relaxed);
+    let mut size = frag_size;
+    if size < 1 {
+        size = 1;
+    }
+    if size > 256 {
+        size = 256;
+    }
+    DPI_FRAG_SIZE.store(size, Ordering::Relaxed);
+    let mut delay = frag_delay_ms;
+    if delay < 0 {
+        delay = 0;
+    }
+    if delay > 1000 {
+        delay = 1000;
+    }
+    DPI_FRAG_DELAY_MS.store(delay, Ordering::Relaxed);
+}
+
+/// Сводка по пулу доменов (для отчётов/диагностики).
+#[unsafe(no_mangle)]
+pub extern "C" fn GetDomainsSummary() -> *mut c_char {
+    let (total, user, cooling) = {
+        let cfg = CFPROXY.read();
+        let total = cfg.domains.len();
+        let user = cfg.user_domains.len();
+        drop(cfg);
+        let cooling = crate::config::DOMAIN_FAIL
+            .read()
+            .values()
+            .filter(|s| {
+                s.until
+                    .map(|u| u > std::time::Instant::now())
+                    .unwrap_or(false)
+            })
+            .count();
+        (total, user, cooling)
+    };
+    let upstream = {
+        let u = UPSTREAM_PROXY_URL.read();
+        if u.trim().is_empty() {
+            "direct".to_string()
+        } else {
+            "upstream".to_string()
+        }
+    };
+    let s = format!("domains={} user={} cooldown={} route={}", total, user, cooling, upstream);
+    CString::new(s).unwrap_or_default().into_raw()
 }
 
 /// # Safety

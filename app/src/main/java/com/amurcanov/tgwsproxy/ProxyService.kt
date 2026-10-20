@@ -41,6 +41,9 @@ class ProxyService : Service() {
     private var lastCfEnabled: Boolean = true
     private var lastCfPriority: Boolean = true
     private var lastCfDomain: String = ""
+    private var lastCfExtraUrls: String = ""
+    private var lastDpiBypass: Boolean = true
+    private var lastUpstreamProxy: String = ""
     private var lastSecretKey: String = ""
 
     companion object {
@@ -54,6 +57,9 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_ENABLED = "EXTRA_CFPROXY_ENABLED"
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
+        const val EXTRA_CFPROXY_EXTRA_URLS = "EXTRA_CFPROXY_EXTRA_URLS"
+        const val EXTRA_DPI_BYPASS = "EXTRA_DPI_BYPASS"
+        const val EXTRA_UPSTREAM_PROXY = "EXTRA_UPSTREAM_PROXY"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
         
         private const val NOTIFICATION_ID = 101
@@ -91,8 +97,12 @@ class ProxyService : Service() {
                 val cfEnabled = intent.getBooleanExtra(EXTRA_CFPROXY_ENABLED, true)
                 val cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true)
                 val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
+                val cfExtraUrls = intent.getStringExtra(EXTRA_CFPROXY_EXTRA_URLS) ?: ""
+                val dpiBypass = intent.getBooleanExtra(EXTRA_DPI_BYPASS, true)
+                val upstreamProxy = intent.getStringExtra(EXTRA_UPSTREAM_PROXY) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey)
+                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain,
+                    cfExtraUrls, dpiBypass, upstreamProxy, secretKey)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -105,7 +115,8 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey)
+                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain,
+                        lastCfExtraUrls, lastDpiBypass, lastUpstreamProxy, lastSecretKey)
                 } else {
                     stopSelf()
                 }
@@ -132,7 +143,9 @@ class ProxyService : Service() {
 
     private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
-                           cfDomain: String = "", secretKey: String = "") {
+                           cfDomain: String = "", cfExtraUrls: String = "",
+                           dpiBypass: Boolean = true, upstreamProxy: String = "",
+                           secretKey: String = "") {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -144,6 +157,9 @@ class ProxyService : Service() {
         lastCfEnabled = cfEnabled
         lastCfPriority = cfPriority
         lastCfDomain = cfDomain
+        lastCfExtraUrls = cfExtraUrls
+        lastDpiBypass = dpiBypass
+        lastUpstreamProxy = upstreamProxy
         lastSecretKey = secretKey
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
@@ -180,6 +196,9 @@ class ProxyService : Service() {
                 NativeProxy.setPoolSize(poolSize)
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
+                NativeProxy.setCfProxyExtraUrls(cfExtraUrls)
+                NativeProxy.setUpstreamProxy(upstreamProxy.trim())
+                NativeProxy.setDpiBypass(dpiBypass)
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
                     serviceScope.launch {
@@ -288,6 +307,9 @@ class ProxyService : Service() {
                 cfEnabled = lastCfEnabled,
                 cfPriority = lastCfPriority,
                 cfDomain = lastCfDomain,
+                cfExtraUrls = lastCfExtraUrls,
+                dpiBypass = lastDpiBypass,
+                upstreamProxy = lastUpstreamProxy,
                 secretKey = lastSecretKey
             )
         }

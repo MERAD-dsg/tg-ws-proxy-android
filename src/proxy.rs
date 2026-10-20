@@ -1162,18 +1162,13 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let addr = format!("{}:{}", dst, port);
-    let mut remote =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
-                return false;
-            }
-            Err(_) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
-                return false;
-            }
-        };
+    let mut remote = match crate::net::outbound_tcp(&addr, Duration::from_secs(10)).await {
+        Ok(r) => r,
+        Err(e) => {
+            lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
+            return false;
+        }
+    };
     let _ = remote.set_nodelay(true);
 
     STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
@@ -1204,9 +1199,12 @@ async fn try_cfproxy_base_domain(
     dc: i32,
     base_domain: &str,
     ws_path: &str,
+    ignore_fail_cooldown: bool,
 ) -> (Option<RawWebSocket>, String) {
-    let base_domain = normalize_cf_domain(base_domain);
-    if base_domain.is_empty() {
+    // Домены в пуле уже каноникализированы (пользовательские — как есть,
+    // encoded-записи — декодированы). Никакого повторного decode!
+    let base_domain = base_domain.trim().trim_end_matches('.').to_lowercase();
+    if base_domain.is_empty() || !is_valid_domain(&base_domain) {
         return (None, String::new());
     }
     let remaining = cfproxy_429_cooldown_remaining(&base_domain);
@@ -1218,6 +1216,17 @@ async fn try_cfproxy_base_domain(
         );
         return (None, String::new());
     }
+    if !ignore_fail_cooldown {
+        let fail_remaining = domain_fail_remaining(&base_domain);
+        if fail_remaining > Duration::ZERO {
+            ldebug!(
+                " CF skip {}: health cooldown {:.0}s",
+                base_domain,
+                fail_remaining.as_secs_f64().ceil()
+            );
+            return (None, String::new());
+        }
+    }
     let _permit = match acquire_cfproxy_attempt_slot().await {
         Some(p) => p,
         None => return (None, String::new()),
@@ -1228,10 +1237,12 @@ async fn try_cfproxy_base_domain(
 
     let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
     if let Some(e) = err {
-        // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
-        // выжигал бы домены и плодил лавину cooldown.
         if is_http_status_error(&e, 429) {
             mark_cfproxy_429_cooldown(&base_domain, &e);
+        } else {
+            // Health-кулдаун на любые ошибки: мёртвый домен быстро выпадает
+            // из активной ротации и возвращается с эскалирующейся паузой.
+            mark_domain_fail(&base_domain);
         }
         if !resolved_ip.is_empty() {
             log_cf_conn_error(
@@ -1245,6 +1256,7 @@ async fn try_cfproxy_base_domain(
     }
 
     clear_cfproxy_429_cooldown(&base_domain);
+    clear_domain_fail(&base_domain);
     if !resolved_ip.is_empty() {
         ldebug!(" CF ok {} via {}", domain, resolved_ip);
     } else {
@@ -1283,7 +1295,7 @@ async fn cfproxy_acquire_ws(
     let mut chosen_domain = String::new();
 
     if !ordered.is_empty() && !ordered[0].is_empty() {
-        let (w, d) = try_cfproxy_base_domain(dc, &ordered[0], ws_path).await;
+        let (w, d) = try_cfproxy_base_domain(dc, &ordered[0], ws_path, false).await;
         ws = w;
         chosen_domain = d;
     }
@@ -1301,7 +1313,7 @@ async fn cfproxy_acquire_ws(
                     _ = cancel.cancelled() => None,
                     r = async {
                         let _p = sem.acquire().await.ok()?;
-                        let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
+                        let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path, false).await;
                         w.map(|ws| (ws, d))
                     } => r,
                 }
@@ -1317,6 +1329,30 @@ async fn cfproxy_acquire_ws(
                         w.close().await;
                     });
                 }
+            }
+        }
+    }
+
+    // Если всё в health-кулдауне (например, после смены сети) — одна
+    // принудительная попытка для доменов с минимальным остатком кулдауна.
+    if ws.is_none() {
+        let cooled: Vec<String> = ordered
+            .iter()
+            .filter(|d| domain_fail_remaining(d) > Duration::ZERO)
+            .cloned()
+            .take(CFPROXY_FALLBACK_PARALLEL)
+            .collect();
+        if !cooled.is_empty() {
+            ldebug!(" CF: все домены в cooldown, форсирую {}", cooled.len());
+        }
+        for bd in cooled {
+            if ws.is_some() {
+                break;
+            }
+            let (w, d) = try_cfproxy_base_domain(dc, &bd, ws_path, true).await;
+            if w.is_some() {
+                ws = w;
+                chosen_domain = d;
             }
         }
     }

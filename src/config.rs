@@ -70,6 +70,11 @@ pub const CFPROXY_ACTIVE_FILE_NAME: &str = "cfproxy-active-domain.txt";
 // Оригинал обновляет пул раз в час (3600с) фоновым потоком.
 pub const CFPROXY_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 pub const CFPROXY_MIN_VALID_DOMAINS: usize = 3;
+
+// Health-кулдаун доменов: после серии ошибок домен временно исключается
+// из ротации, чтобы мёртвые домены не съедали время подключения.
+pub const DOMAIN_FAIL_COOLDOWN_INITIAL: Duration = Duration::from_secs(30);
+pub const DOMAIN_FAIL_COOLDOWN_MAX: Duration = Duration::from_secs(1800);
 pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(4);
 pub const CFPROXY_FALLBACK_PARALLEL: usize = 2;
 pub const CFPROXY_429_COOLDOWN: Duration = Duration::from_secs(45);
@@ -102,7 +107,10 @@ impl Default for Cfproxy429State {
 pub static CFPROXY_ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub struct CfproxyConfig {
+    /// Сырая строка пользователя (для совместимости/диагностики).
     pub user_domain: String,
+    /// Канонические пользовательские домены (используются как есть).
+    pub user_domains: Vec<String>,
     pub domains: Vec<String>,
     pub active: String,
     pub cache_dir: String,
@@ -111,11 +119,26 @@ pub struct CfproxyConfig {
 pub static CFPROXY: Lazy<RwLock<CfproxyConfig>> = Lazy::new(|| {
     RwLock::new(CfproxyConfig {
         user_domain: String::new(),
+        user_domains: Vec::new(),
         domains: Vec::new(),
         active: String::new(),
         cache_dir: String::new(),
     })
 });
+
+/// Пользовательские URL со списками доменов (plain-text, домен на строку).
+pub static CFPROXY_EXTRA_URLS: Lazy<RwLock<Vec<String>>> =
+    Lazy::new(|| RwLock::new(Vec::new()));
+
+/// Внешний SOCKS5/HTTP-апстрим для всех исходящих соединений
+/// (например, SOCKS5-шлюз поверх Cloudflare WARP). Пусто — напрямую.
+pub static UPSTREAM_PROXY_URL: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new(String::new()));
+
+// Обход DPI: фрагментация первого TCP-сегмента (TLS ClientHello).
+pub static DPI_BYPASS_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static DPI_FRAG_SIZE: AtomicI32 = AtomicI32::new(1);
+pub static DPI_FRAG_DELAY_MS: AtomicI32 = AtomicI32::new(25);
 
 // proxy/config.py: cfproxy_worker_domains + fake_tls_domain
 pub static CF_WORKER_DOMAINS: Lazy<RwLock<Vec<String>>> =
@@ -126,8 +149,161 @@ pub static FAKE_TLS_DOMAIN: Lazy<RwLock<String>> =
 pub static CFPROXY_429: Lazy<RwLock<HashMap<String, Cfproxy429State>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-pub const CFPROXY_DOMAINS_URL: &str =
-    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt";
+/// Источники списка CF-доменов. Первый — оригинал Flowseal (закодированный
+/// формат .com -> .co.uk), остальные — зеркала на случай блокировки
+/// raw.githubusercontent.com. Пользовательские URL добавляются поверх.
+pub static CFPROXY_DOMAINS_URLS: &[&str] = &[
+    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
+    "https://cdn.jsdelivr.net/gh/Flowseal/tg-ws-proxy@main/.github/cfproxy-domains.txt",
+];
+
+// ---------------------------------------------------------------------------
+// Health-состояние доменов: эскалирующийся cooldown после ошибок подключения
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct DomainFailState {
+    pub until: Option<std::time::Instant>,
+    pub strikes: i32,
+}
+
+impl Default for DomainFailState {
+    fn default() -> Self {
+        DomainFailState {
+            until: None,
+            strikes: 0,
+        }
+    }
+}
+
+pub static DOMAIN_FAIL: Lazy<RwLock<HashMap<String, DomainFailState>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn domain_key(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_lowercase()
+}
+
+/// Сколько ещё домен «плохой» (ZERO — можно использовать).
+pub fn domain_fail_remaining(domain: &str) -> Duration {
+    let key = domain_key(domain);
+    if key.is_empty() {
+        return Duration::ZERO;
+    }
+    let state = match DOMAIN_FAIL.read().get(&key).cloned() {
+        Some(s) => s,
+        None => return Duration::ZERO,
+    };
+    let until = match state.until {
+        Some(u) => u,
+        None => return Duration::ZERO,
+    };
+    let now = std::time::Instant::now();
+    if until <= now {
+        DOMAIN_FAIL.write().remove(&key);
+        return Duration::ZERO;
+    }
+    until - now
+}
+
+/// Пометить домен плохим: cooldown растёт экспоненциально (30с -> ... -> 30мин).
+pub fn mark_domain_fail(domain: &str) {
+    let key = domain_key(domain);
+    if key.is_empty() {
+        return;
+    }
+    let mut map = DOMAIN_FAIL.write();
+    let prev = map.get(&key).cloned().unwrap_or_default();
+    let now = std::time::Instant::now();
+    let expired = match prev.until {
+        None => true,
+        Some(u) => u <= now,
+    };
+    let mut strikes = if expired {
+        // если прошлый cooldown истёк давно — начинаем с чистого листа
+        if prev.strikes > 0 {
+            match prev.until {
+                Some(u) if now.duration_since(u) > DOMAIN_FAIL_COOLDOWN_MAX => 0,
+                _ => prev.strikes,
+            }
+        } else {
+            0
+        }
+    } else {
+        prev.strikes
+    };
+    strikes += 1;
+    let mut delay = DOMAIN_FAIL_COOLDOWN_INITIAL;
+    for _ in 1..strikes {
+        delay *= 2;
+        if delay >= DOMAIN_FAIL_COOLDOWN_MAX {
+            delay = DOMAIN_FAIL_COOLDOWN_MAX;
+            break;
+        }
+    }
+    map.insert(
+        key,
+        DomainFailState {
+            until: Some(now + delay),
+            strikes,
+        },
+    );
+}
+
+pub fn clear_domain_fail(domain: &str) {
+    let key = domain_key(domain);
+    if !key.is_empty() {
+        DOMAIN_FAIL.write().remove(&key);
+    }
+}
+
+/// Пользовательский домен: используется как есть (без декодирования и
+/// без требования .co.uk). Принимает URL-мусор вида https://x.y/path:443.
+pub fn canonicalize_user_domain(raw: &str) -> Option<String> {
+    let mut s = raw.trim().to_lowercase();
+    for p in ["https://", "http://", "wss://", "ws://"] {
+        if let Some(r) = s.strip_prefix(p) {
+            s = r.to_string();
+        }
+    }
+    if let Some(idx) = s.find('/') {
+        s.truncate(idx);
+    }
+    if let Some(idx) = s.find('?') {
+        s.truncate(idx);
+    }
+    // порт в конце (не IPv6 — домены только)
+    if let Some(idx) = s.find(':') {
+        if !s[idx + 1..].is_empty() && s[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
+            s.truncate(idx);
+        }
+    }
+    let s = s.trim().trim_end_matches('.').to_string();
+    if s.is_empty() || !is_valid_domain(&s) {
+        return None;
+    }
+    Some(s)
+}
+
+/// Каноникализация записи из внешнего списка доменов.
+/// Записи с суффиксом ".com" — обфусцированный встроенный формат Flowseal
+/// (декодируется в ".co.uk"), остальное берётся как есть. Это позволяет
+/// смешивать в одном списке и encoded-домены, и обычные (dont-block-it.uk и т.п.).
+pub fn canonicalize_pool_entry(raw: &str) -> Option<String> {
+    let item = raw.trim().to_lowercase();
+    if item.is_empty() {
+        return None;
+    }
+    let cand = if item.ends_with(".com") {
+        crate::cfproxy::decode_cf_domain(&item)
+    } else {
+        item.clone()
+    };
+    let cand = cand.trim().trim_end_matches('.').to_string();
+    if cand.is_empty() || !is_valid_domain(&cand) {
+        return None;
+    }
+    Some(cand)
+}
 
 // MTProto proxy secret
 pub static PROXY_SECRET: Lazy<RwLock<String>> =

@@ -1,0 +1,86 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-test:
+    name: Rust tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --lib
+
+  build-android:
+    name: Native libs + APK
+    runs-on: ubuntu-latest
+    needs: rust-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          link-to-sdk: false
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@cargo-ndk
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build native libraries
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -o app/src/main/jniLibs build --release
+          ls -la app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APKs
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/universal/release/*.apk dist/ 2>/dev/null || true
+          cp app/build/outputs/apk/arm64/release/*.apk dist/ 2>/dev/null || true
+          cp app/build/outputs/apk/arm32/release/*.apk dist/ 2>/dev/null || true
+          cp app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so dist/libtgwsproxy-arm64-v8a.so
+          cp app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so dist/libtgwsproxy-armeabi-v7a.so
+          ls -la dist
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-ws-proxy-android-apk
+          path: dist/
+          if-no-files-found: error

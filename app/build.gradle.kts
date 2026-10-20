@@ -102,6 +102,7 @@ android {
             } else {
                 println("⚠️ WARNING: Keystore not found, using debug signing")
                 println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
+                signingConfig = signingConfigs.getByName("debug")
             }
         }
     }

@@ -90,6 +90,9 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
     val savedCustomDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
+    val savedCfExtraUrls by settingsStore.cfproxyExtraUrls.collectAsStateWithLifecycle(initialValue = "")
+    val savedDpiBypassEnabled by settingsStore.dpiBypassEnabled.collectAsStateWithLifecycle(initialValue = true)
+    val savedUpstreamProxyUrl by settingsStore.upstreamProxyUrl.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
@@ -125,6 +128,9 @@ fun SettingsTab(settingsStore: SettingsStore) {
     var cfEnabled by rememberSaveable(savedCfEnabled) { mutableStateOf(savedCfEnabled) }
     var customCfDomainEnabled by rememberSaveable(savedCustomDomainEnabled) { mutableStateOf(savedCustomDomainEnabled) }
     var customCfDomain by rememberSaveable(savedCustomDomain) { mutableStateOf(savedCustomDomain) }
+    var cfExtraUrls by rememberSaveable(savedCfExtraUrls) { mutableStateOf(savedCfExtraUrls) }
+    var dpiBypassEnabled by rememberSaveable(savedDpiBypassEnabled) { mutableStateOf(savedDpiBypassEnabled) }
+    var upstreamProxyUrl by rememberSaveable(savedUpstreamProxyUrl) { mutableStateOf(savedUpstreamProxyUrl) }
     var secretKeyText by remember(savedSecretKey) { mutableStateOf(if (savedSecretKey == "LOADING") "" else savedSecretKey) }
 
     LaunchedEffect(savedSecretKey) {
@@ -147,7 +153,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 isDcAuto, dc1Text, dc2Text, dc3Text, dc4Text, dc5Text, dc203Text,
                 dc1mText, dc2mText, dc3mText, dc4mText, dc5mText, dc203mText,
                 experimentalMode, bindIpText, portText, selectedPoolSize,
-                cfEnabled, customCfDomainEnabled, customCfDomain, secretKeyText
+                cfEnabled, customCfDomainEnabled, customCfDomain,
+                cfExtraUrls, dpiBypassEnabled, upstreamProxyUrl, secretKeyText
             )
         }
     }
@@ -406,6 +413,152 @@ fun SettingsTab(settingsStore: SettingsStore) {
                         scheduleSave()
                     },
                     enabled = !isRunning
+                )
+            }
+
+            if (cfEnabled) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            stringResource(com.amurcanov.tgwsproxy.R.string.custom_cf_domains),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Switch(
+                            checked = customCfDomainEnabled,
+                            onCheckedChange = {
+                                customCfDomainEnabled = it
+                                scheduleSave()
+                            },
+                            enabled = !isRunning
+                        )
+                    }
+                    if (customCfDomainEnabled) {
+                        OutlinedTextField(
+                            value = customCfDomain,
+                            onValueChange = {
+                                customCfDomain = it
+                                scheduleSave()
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            minLines = 2,
+                            enabled = !isRunning,
+                            placeholder = {
+                                Text("dont-block-it.uk, my-proxy.example.com")
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                            )
+                        )
+                        Text(
+                            stringResource(com.amurcanov.tgwsproxy.R.string.custom_cf_domains_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = cfExtraUrls,
+                        onValueChange = {
+                            cfExtraUrls = it
+                            scheduleSave()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !isRunning,
+                        singleLine = true,
+                        label = {
+                            Text(stringResource(com.amurcanov.tgwsproxy.R.string.cf_domains_url))
+                        },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                        )
+                    )
+                    Text(
+                        stringResource(com.amurcanov.tgwsproxy.R.string.cf_domains_url_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        stringResource(com.amurcanov.tgwsproxy.R.string.dpi_bypass),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = dpiBypassEnabled,
+                        onCheckedChange = {
+                            dpiBypassEnabled = it
+                            scheduleSave()
+                        },
+                        enabled = !isRunning
+                    )
+                }
+                Text(
+                    stringResource(com.amurcanov.tgwsproxy.R.string.dpi_bypass_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedTextField(
+                    value = upstreamProxyUrl,
+                    onValueChange = {
+                        upstreamProxyUrl = it
+                        scheduleSave()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !isRunning,
+                    singleLine = true,
+                    label = {
+                        Text(stringResource(com.amurcanov.tgwsproxy.R.string.upstream_proxy))
+                    },
+                    placeholder = {
+                        Text("socks5://127.0.0.1:1080")
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                    )
+                )
+                Text(
+                    stringResource(com.amurcanov.tgwsproxy.R.string.upstream_proxy_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 

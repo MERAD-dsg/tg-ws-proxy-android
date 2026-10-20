@@ -69,12 +69,34 @@ pub fn merge_cfproxy_domains(lists: &[Vec<String>]) -> Vec<String> {
     let mut merged = Vec::new();
     for list in lists {
         for raw in list {
-            let d = normalize_cf_domain(raw);
-            if d.is_empty() || seen.contains(&d) {
+            // Записи из внешних списков каноникализируем: encoded (.com)
+            // декодируется, обычные домены (dont-block-it.uk и т.п.) берутся
+            // как есть.
+            let d = match crate::config::canonicalize_pool_entry(raw) {
+                Some(d) => d,
+                None => continue,
+            };
+            if seen.contains(&d) {
                 continue;
             }
-            // Дополнительно валидируем как в _normalize_domain_pool оригинала.
-            if !crate::config::is_valid_domain(&d) {
+            seen.insert(d.clone());
+            merged.push(d);
+        }
+    }
+    merged
+}
+
+/// Пользовательские домены — строго как есть (без decode).
+pub fn merge_user_domains(lists: &[Vec<String>]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for list in lists {
+        for raw in list {
+            let d = match crate::config::canonicalize_user_domain(raw) {
+                Some(d) => d,
+                None => continue,
+            };
+            if seen.contains(&d) {
                 continue;
             }
             seen.insert(d.clone());
@@ -92,8 +114,12 @@ pub fn clear_cfproxy_429_cooldowns() {
     CFPROXY_429.write().clear();
 }
 
+fn cooldown_key(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_lowercase()
+}
+
 pub fn clear_cfproxy_429_cooldown(domain: &str) {
-    let d = normalize_cf_domain(domain);
+    let d = cooldown_key(domain);
     if d.is_empty() {
         return;
     }
@@ -147,7 +173,7 @@ pub fn next_cfproxy_429_cooldown_delay(prev: &Cfproxy429State, retry_after: Dura
 }
 
 pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
-    let d = normalize_cf_domain(domain);
+    let d = cooldown_key(domain);
     if d.is_empty() {
         return;
     }
@@ -175,7 +201,7 @@ pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
 }
 
 pub fn cfproxy_429_cooldown_remaining(domain: &str) -> Duration {
-    let d = normalize_cf_domain(domain);
+    let d = cooldown_key(domain);
     if d.is_empty() {
         return Duration::ZERO;
     }
@@ -276,33 +302,48 @@ fn should_refresh_cfproxy_domains() -> bool {
 pub fn init_cfproxy_domains() {
     let defaults = default_cfproxy_domains();
     let cached = load_cfproxy_domains_from_cache();
+    let user = CFPROXY.read().user_domains.clone();
 
-    let mut cfg = CFPROXY.write();
-    if !cfg.user_domain.is_empty() {
-        let ud = cfg.user_domain.clone();
-        cfg.domains = vec![ud.clone()];
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
-        return;
+    // Приоритет: пользовательские домены (как есть) -> кеш -> встроенный пул.
+    // Всё вместе: свои домены работают первыми, авто-пул — как запасной.
+    let mut merged = Vec::new();
+    if !user.is_empty() {
+        merged.extend(user.iter().cloned());
     }
+    merged.extend(cached.iter().cloned());
+    merged.extend(defaults.iter().cloned());
+    merged = {
+        let mut seen = std::collections::HashSet::new();
+        merged
+            .into_iter()
+            .filter(|d| seen.insert(d.clone()))
+            .collect()
+    };
 
-    if !cached.is_empty() {
-        let n = cached.len();
-        cfg.domains = merge_cfproxy_domains(&[cached, defaults]);
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
-        drop(cfg);
-        linfo!(" CF: кеш доменов загружен ({} шт.)", n);
-    } else {
-        cfg.domains = defaults;
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
+    let n_user = user.len();
+    let n_total = merged.len();
+    {
+        let mut cfg = CFPROXY.write();
+        cfg.domains = merged.clone();
+    }
+    crate::balancer::BALANCER
+        .write()
+        .update_domains_list_with_priority(n_user, &merged);
+    if n_user > 0 {
+        linfo!(
+            " CF: пользовательские домены ({}) + авто-пул, всего {}",
+            n_user,
+            n_total
+        );
     }
 }
 
 pub fn start_cfproxy_refresh() {
-    // Порт proxy/config.py::start_cfproxy_domain_refresh: сначала пробуем
-    // обновить сразу (до 3 попыток), затем раз в час фоновым таском.
-    // На мобиле уважаем свежесть дискового кеша для первой попытки.
-    if !should_refresh_cfproxy_domains() {
-        ldebug!(" CF: кеш свежий, откладываю обновление списка на час");
+    // Одна фоновая петля на процесс: сначала пробуем обновить сразу
+    // (до 3 попыток), затем раз в час.
+    static REFRESH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REFRESH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
     tokio::spawn(async move {
         if should_refresh_cfproxy_domains() {
@@ -312,9 +353,6 @@ pub fn start_cfproxy_refresh() {
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
-            if CFPROXY.read().domains.is_empty() {
-                ldebug!(" CF: обновить список доменов не удалось, остаюсь на кеше/встроенном списке");
-            }
         }
         loop {
             tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
@@ -323,20 +361,22 @@ pub fn start_cfproxy_refresh() {
     });
 }
 
-pub async fn try_refresh_cfproxy_domains() -> bool {
-    let has_user = !CFPROXY.read().user_domain.is_empty();
-    if has_user {
-        return true;
+/// Все источники списков доменов: пользовательские URL, затем встроенные.
+fn domain_list_sources() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for u in CFPROXY_EXTRA_URLS.read().iter() {
+        let u = u.trim().to_string();
+        if u.starts_with("http://") || u.starts_with("https://") {
+            out.push(u);
+        }
     }
+    for u in CFPROXY_DOMAINS_URLS {
+        out.push(u.to_string());
+    }
+    out
+}
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
+async fn fetch_domain_list_source(client: &reqwest::Client, url: &str) -> Option<Vec<String>> {
     // Cache-buster как в оригинале ("?" + 7 случайных букв), UA tg-ws-proxy.
     let nonce: String = {
         use rand::Rng;
@@ -345,70 +385,110 @@ pub async fn try_refresh_cfproxy_domains() -> bool {
             .map(|_| rng.gen_range(b'a'..=b'z') as char)
             .collect()
     };
-    let url = format!("{}?{}", CFPROXY_DOMAINS_URL, nonce);
+    let full = format!("{}{}{}", url, if url.contains('?') { "&" } else { "?" }, nonce);
     let resp = match client
-        .get(&url)
+        .get(&full)
         .header("User-Agent", "tg-ws-proxy")
         .send()
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            ldebug!(" CF: GitHub недоступен: {}", e);
-            return false;
+            ldebug!(" CF: источник {} недоступен: {}", url, e);
+            return None;
         }
     };
     if resp.status().as_u16() != 200 {
-        ldebug!(" CF: GitHub вернул {}", resp.status().as_u16());
-        return false;
+        ldebug!(" CF: источник {} вернул {}", url, resp.status().as_u16());
+        return None;
     }
     let body = match resp.text().await {
         Ok(b) => b,
         Err(e) => {
-            ldebug!(" CF: список доменов прочитать не удалось: {}", e);
-            return false;
+            ldebug!(" CF: источник {} не прочитался: {}", url, e);
+            return None;
         }
     };
-
-    let mut fetched_raw = Vec::new();
+    let mut lines = Vec::new();
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        fetched_raw.push(line.to_string());
+        lines.push(line.to_string());
     }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
+    }
+}
 
-    // Валидация пула как в оригинале: минимум CFPROXY_MIN_VALID_DOMAINS
-    // валидных доменов, иначе игнорируем payload и остаёмся на текущем пуле.
-    let decoded: Vec<String> = fetched_raw.iter().map(|d| normalize_cf_domain(d)).collect();
-    let pool = normalize_domain_pool(&decoded);
-    if pool.len() >= CFPROXY_MIN_VALID_DOMAINS {
-        let merged = merge_cfproxy_domains(&[pool.clone(), default_cfproxy_domains()]);
-        {
-            let mut cfg = CFPROXY.write();
-            if !cfg.user_domain.is_empty() {
-                return true;
-            }
-            cfg.domains = merged.clone();
+pub async fn try_refresh_cfproxy_domains() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let mut all_raw: Vec<String> = Vec::new();
+    let mut sources_used = 0;
+    for url in domain_list_sources() {
+        if let Some(lines) = fetch_domain_list_source(&client, &url).await {
+            sources_used += 1;
+            all_raw.extend(lines);
         }
-        crate::balancer::BALANCER.write().update_domains_list(&merged);
-        save_cfproxy_domains_to_cache(&merged);
-        linfo!(" CF: список доменов обновлен ({} шт.)", pool.len());
-        return true;
+    }
+    if all_raw.is_empty() {
+        ldebug!(" CF: обновить список доменов не удалось (все источники недоступны)");
+        return false;
     }
 
-    if !fetched_raw.is_empty() {
+    let pool = merge_cfproxy_domains(&[all_raw.clone()]);
+    if pool.len() < CFPROXY_MIN_VALID_DOMAINS {
         lwarn!(
             " CF: игнорирую список доменов (total={}, valid={}, need>={}); остаюсь на текущем пуле",
-            fetched_raw.len(),
+            all_raw.len(),
             pool.len(),
             CFPROXY_MIN_VALID_DOMAINS
         );
-    } else {
-        ldebug!(" CF: обновить список доменов не удалось (пустой ответ), остаюсь на кеше/встроенном списке");
+        return false;
     }
-    false
+
+    // Склеиваем: пользовательские -> свежий пул -> кеш -> встроенный.
+    let user = CFPROXY.read().user_domains.clone();
+    let cached = load_cfproxy_domains_from_cache();
+    let defaults = default_cfproxy_domains();
+    let mut merged = Vec::new();
+    merged.extend(user.iter().cloned());
+    merged.extend(pool.iter().cloned());
+    merged.extend(cached.iter().cloned());
+    merged.extend(defaults.iter().cloned());
+    let merged = {
+        let mut seen = std::collections::HashSet::new();
+        merged
+            .into_iter()
+            .filter(|d| seen.insert(d.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    {
+        let mut cfg = CFPROXY.write();
+        cfg.domains = merged.clone();
+    }
+    crate::balancer::BALANCER
+        .write()
+        .update_domains_list_with_priority(user.len(), &merged);
+    save_cfproxy_domains_to_cache(&pool);
+    linfo!(
+        " CF: список доменов обновлен ({} из {} источников, {} в пуле)",
+        pool.len(),
+        sources_used,
+        merged.len()
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -626,4 +706,66 @@ pub fn log_cf_conn_error(msg: &str, err: &WsError) {
 // активный домен set/save
 pub fn set_active_domain_and_save(_chosen: &str) {
     // Больше не используется для файлов. Балансер обновляется внутри proxy.rs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_known_encoded_domain() {
+        // virkgj.com -> известный encoded-домен из встроенного списка
+        let d = decode_cf_domain("virkgj.com");
+        assert!(d.ends_with(".co.uk"), "decoded = {}", d);
+        assert_eq!(normalize_cf_domain("virkgj.com"), d);
+    }
+
+    #[test]
+    fn pool_entry_encoded_and_plain() {
+        // encoded .com декодируется
+        let enc = canonicalize_pool_entry("virkgj.com").unwrap();
+        assert!(enc.ends_with(".co.uk"));
+        // обычный домен (в т.ч. вида dont-block-it.uk) берётся как есть
+        assert_eq!(
+            canonicalize_pool_entry("dont-block-it.uk").unwrap(),
+            "dont-block-it.uk"
+        );
+        assert_eq!(
+            canonicalize_pool_entry("DONT-BLOCK-IT.UK").unwrap(),
+            "dont-block-it.uk"
+        );
+        assert!(canonicalize_pool_entry("not a domain!!").is_none());
+        assert!(canonicalize_pool_entry("").is_none());
+    }
+
+    #[test]
+    fn user_domains_as_is() {
+        assert_eq!(
+            canonicalize_user_domain("dont-block-it.uk").unwrap(),
+            "dont-block-it.uk"
+        );
+        assert_eq!(
+            canonicalize_user_domain("https://MyProxy.example.com/path").unwrap(),
+            "myproxy.example.com"
+        );
+        assert_eq!(
+            canonicalize_user_domain("myproxy.example.com:443").unwrap(),
+            "myproxy.example.com"
+        );
+        // .com НЕ декодируется для пользовательских доменов
+        assert_eq!(
+            canonicalize_user_domain("virkgj.com").unwrap(),
+            "virkgj.com"
+        );
+        assert!(canonicalize_user_domain("no").is_none());
+    }
+
+    #[test]
+    fn user_domain_merge_dedup() {
+        let m = merge_user_domains(&[
+            vec!["a.example.com".to_string(), "b.example.com".to_string()],
+            vec!["A.example.com".to_string()],
+        ]);
+        assert_eq!(m, vec!["a.example.com".to_string(), "b.example.com".to_string()]);
+    }
 }
