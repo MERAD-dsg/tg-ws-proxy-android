@@ -29,10 +29,13 @@ jobs:
             echo "===== BUILD OUTPUT TAIL ====="
             tail -n 200 cargo-out.txt
             # emit as annotations so failures are visible via the Checks API
-            tail -n 200 cargo-out.txt | fold -w 3500 | head -40 | while IFS= read -r line; do
-              line="${line//'%'/'%25'}"
-              echo "::error::${line}"
-            done
+            emit() {
+              fold -w 3500 | head -45 | while IFS= read -r line; do
+                line="${line//'%'/'%25'}"
+                echo "::error::${line}"
+              done
+            }
+            grep -nE "^(error|warning: unused)|^ *--> |could not compile|test result: FAILED|panicked at|^---- .* stdout ----|^failures:" cargo-out.txt | tail -60 | emit
             exit "$code"
           fi
 
@@ -85,7 +88,13 @@ jobs:
           ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee gradle-out.txt
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
-            tail -n 200 gradle-out.txt | fold -w 3500 | head -40 | while IFS= read -r line; do
+            # Gradle: сохраняем хвост и строки с ошибками Kotlin/AGP.
+            tail -n 200 gradle-out.txt
+            {
+              grep -nE "^e: |error:|FAILURE:|What went wrong|Caused by|Execution failed" gradle-out.txt | tail -40
+              echo "--- tail ---"
+              tail -n 15 gradle-out.txt
+            } | fold -w 3500 | head -55 | while IFS= read -r line; do
               line="${line//'%'/'%25'}"
               echo "::error::${line}"
             done
