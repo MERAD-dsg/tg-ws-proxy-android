@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           set +e
           cargo test --lib 2>&1 | tee cargo-out.txt
@@ -35,7 +37,9 @@ jobs:
                 echo "::error::${line}"
               done
             }
-            grep -nE "^(error|warning: unused)|^ *--> |could not compile|test result: FAILED|panicked at|^---- .* stdout ----|^failures:" cargo-out.txt | tail -60 | emit
+            sed 's/\x1b\[[0-9;]*m//g' cargo-out.txt \
+              | grep -nE "^(error|warning: unused|warning: never used)|^ *--> |could not compile|test result: FAILED|panicked at|^---- .* stdout ----|^failures:" \
+              | tail -60 | emit
             exit "$code"
           fi
 
@@ -85,7 +89,7 @@ jobs:
         run: |
           set +e
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee gradle-out.txt
+          ./gradlew assembleRelease --no-daemon --console=plain --stacktrace 2>&1 | tee gradle-out.txt
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
             # Gradle: сохраняем хвост и строки с ошибками Kotlin/AGP.
