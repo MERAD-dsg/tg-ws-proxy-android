@@ -1710,6 +1710,42 @@ where
         // CF не дал ws — halves НЕ тронуты, идём в TCP fallback ниже.
     }
 
+    // Шаг 2.5: прямой WS. Если worker выбран приоритетным, прямой маршрут в
+    // этом соединении ещё не пробовали — даём ему шанс перед TCP, иначе при
+    // недоступном worker (например, заблокирован workers.dev) не остаётся
+    // вообще ничего.
+    if use_worker && !is_test {
+        for domain in ws_domains(dc, is_media) {
+            match ws_connect_full_opts("", &domain, ws_path, WS_FAIL_TIMEOUT, None, Some(true)).await
+            {
+                Ok(ws) => {
+                    if ws.send(relay_init).await.is_ok() {
+                        STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
+                        linfo!("[{}] DC{}{} -> прямой WS {} (после worker)", label, dc, m_tag, domain);
+                        bridge_ws(
+                            conn_read,
+                            conn_write,
+                            ws,
+                            label,
+                            dc,
+                            is_media,
+                            splitter,
+                            clt_dec.clone_state(),
+                            clt_enc.clone_state(),
+                            tg_enc.clone_state(),
+                            tg_dec.clone_state(),
+                            cancel_token,
+                        )
+                        .await;
+                        return true;
+                    }
+                    ws.close().await;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     // Шаг 3: tcp.
     if !fallback_dst.is_empty() {
         linfo!(
@@ -1734,6 +1770,13 @@ where
         .await;
     }
 
+    if log_once_per("all-routes-failed", 20) {
+        lwarn!(
+            " DC{}{}: ни один маршрут не сработал (прямой WS, worker, CF, TCP). \
+             Нажмите «Проверить маршруты» в настройках",
+            dc, m_tag
+        );
+    }
     false
 }
 
@@ -1830,7 +1873,16 @@ pub async fn handle_client(
             }
         }
         if first[0] == faketls::TLS_RECORD_HANDSHAKE {
-            match faketls::server_handshake(conn, first[0], &secret_bytes, &masking, &label).await
+            let tls_secrets: Vec<Vec<u8>> = secret_candidates()
+                .into_iter()
+                .map(|(_, bytes)| bytes)
+                .collect();
+            let tls_secrets = if tls_secrets.is_empty() {
+                vec![secret_bytes.clone()]
+            } else {
+                tls_secrets
+            };
+            match faketls::server_handshake(conn, first[0], &tls_secrets, &masking, &label).await
             {
                 Some(plain) => {
                     serve_core(

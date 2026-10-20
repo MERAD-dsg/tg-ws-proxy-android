@@ -321,10 +321,16 @@ impl AsyncWrite for TlsRecordWriter {
     }
 }
 
+/// FakeTLS-хендшейк с перебором секретов.
+///
+/// Telegram хранит ссылку со своим секретом; после смены секрета в приложении
+/// старая ссылка продолжает стучаться. Перебираем активный и недавние
+/// секреты, чтобы не сваливаться в маскировку (внешне это выглядело как
+/// «подключился, но висит на Обновление…»).
 pub async fn server_handshake(
     mut conn: TcpStream,
     first: u8,
-    secret: &[u8],
+    secrets: &[Vec<u8>],
     masking: &str,
     label: &str,
 ) -> Option<FakeTlsStream> {
@@ -355,8 +361,12 @@ pub async fn server_handshake(
     client_hello.extend_from_slice(&tls_header);
     client_hello.extend_from_slice(&body);
 
-    match verify_client_hello(&client_hello, secret) {
-        Some((client_random, session_id, ts)) => {
+    let verified = secrets
+        .iter()
+        .find_map(|secret| verify_client_hello(&client_hello, secret).map(|v| (v, secret)));
+
+    match verified {
+        Some(((client_random, session_id, ts), secret)) => {
             log_debug(&format!("[{}] Fake TLS handshake ok (ts={})", label, ts));
             let server_hello = build_server_hello(secret, &client_random, &session_id);
             if conn.write_all(&server_hello).await.is_err() {
@@ -371,6 +381,12 @@ pub async fn server_handshake(
             })
         }
         None => {
+            // Раньше здесь молча уходили в маскировку, и в логах не было
+            // ничего похожего на «bad handshake» — проблема была невидимой.
+            log_warn(&format!(
+                "[{}] FakeTLS: ни один секрет не подошёл -> маскировка {}",
+                label, masking
+            ));
             log_debug(&format!(
                 "[{}] Fake TLS verify failed (size={} rec={}) -> masking",
                 label,
