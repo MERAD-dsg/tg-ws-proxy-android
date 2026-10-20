@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   rust-test:
@@ -108,3 +108,17 @@ jobs:
           name: tg-ws-proxy-android-apk
           path: dist/
           if-no-files-found: error
+
+      - name: Publish CI release (prerelease)
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.2.3-ci
+          name: CI build (branch ${{ github.ref_name }})
+          prerelease: true
+          body: |
+            Автоматическая сборка из ветки `${{ github.ref_name }}` (commit ${{ github.sha }}).
+            APK уже содержат свежесобранные `libtgwsproxy.so`.
+            Это pre-release — обычные пользователи его не увидят.
+          files: dist/*.apk
+          make_latest: false
