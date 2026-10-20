@@ -136,17 +136,23 @@ mod tests {
         // закреплённый домен всегда первый
         let pinned = b.dc_to_domain.get(&2).cloned().unwrap();
         assert_eq!(order[0], pinned);
-        // среди остальных приоритетные встречаются раньше авто-пула:
-        // проверяем, что множество первых двух не хуже «приоритет+возможно pinned»
-        let idx_u1 = order.iter().position(|d| d == "u1.com").unwrap();
-        let idx_u2 = order.iter().position(|d| d == "u2.com").unwrap();
-        let idx_a1 = order.iter().position(|d| d == "a1.com").unwrap();
-        let idx_a2 = order.iter().position(|d| d == "a2.com").unwrap();
-        let max_user = idx_u1.max(idx_u2);
-        let min_auto = idx_a1.min(idx_a2);
-        if pinned != "u1.com" && pinned != "u2.com" {
-            assert!(max_user < min_auto, "user domains must precede auto pool");
-        }
+        // Закреплённый домен может быть и пользовательским, и авто-пула,
+        // поэтому сравниваем порядок уже без него — иначе тест зависит
+        // от случайного выбора pinned и падает через раз.
+        let rest: Vec<String> = order.iter().filter(|d| **d != pinned).cloned().collect();
+        let idx_user = rest
+            .iter()
+            .rposition(|d| d == "u1.com" || d == "u2.com")
+            .expect("user domains present");
+        let idx_auto = rest
+            .iter()
+            .position(|d| d == "a1.com" || d == "a2.com")
+            .expect("auto domains present");
+        assert!(
+            idx_user < idx_auto,
+            "user domains must precede auto pool: {:?}",
+            rest
+        );
     }
 
     #[test]
