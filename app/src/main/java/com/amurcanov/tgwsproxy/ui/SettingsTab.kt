@@ -91,6 +91,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedCustomDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val savedCfExtraUrls by settingsStore.cfproxyExtraUrls.collectAsStateWithLifecycle(initialValue = "")
+    val savedCfWorkerDomains by settingsStore.cfWorkerDomains.collectAsStateWithLifecycle(initialValue = "")
     val savedDpiBypassEnabled by settingsStore.dpiBypassEnabled.collectAsStateWithLifecycle(initialValue = true)
     val savedUpstreamProxyUrl by settingsStore.upstreamProxyUrl.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
@@ -129,6 +130,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     var customCfDomainEnabled by rememberSaveable(savedCustomDomainEnabled) { mutableStateOf(savedCustomDomainEnabled) }
     var customCfDomain by rememberSaveable(savedCustomDomain) { mutableStateOf(savedCustomDomain) }
     var cfExtraUrls by rememberSaveable(savedCfExtraUrls) { mutableStateOf(savedCfExtraUrls) }
+    var cfWorkerDomains by rememberSaveable(savedCfWorkerDomains) { mutableStateOf(savedCfWorkerDomains) }
     var dpiBypassEnabled by rememberSaveable(savedDpiBypassEnabled) { mutableStateOf(savedDpiBypassEnabled) }
     var upstreamProxyUrl by rememberSaveable(savedUpstreamProxyUrl) { mutableStateOf(savedUpstreamProxyUrl) }
     var secretKeyText by remember(savedSecretKey) { mutableStateOf(if (savedSecretKey == "LOADING") "" else savedSecretKey) }
@@ -154,7 +156,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 dc1mText, dc2mText, dc3mText, dc4mText, dc5mText, dc203mText,
                 experimentalMode, bindIpText, portText, selectedPoolSize,
                 cfEnabled, customCfDomainEnabled, customCfDomain,
-                cfExtraUrls, dpiBypassEnabled, upstreamProxyUrl, secretKeyText
+                cfExtraUrls, dpiBypassEnabled, upstreamProxyUrl, secretKeyText,
+                cfWorkerDomains
             )
         }
     }
@@ -455,7 +458,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
                             minLines = 2,
                             enabled = !isRunning,
                             placeholder = {
-                                Text("dont-block-it.uk, my-proxy.example.com")
+                                Text("my-proxy.example.com")
                             },
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = MaterialTheme.colorScheme.primary,
@@ -489,6 +492,31 @@ fun SettingsTab(settingsStore: SettingsStore) {
                     )
                     Text(
                         stringResource(com.amurcanov.tgwsproxy.R.string.cf_domains_url_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    OutlinedTextField(
+                        value = cfWorkerDomains,
+                        onValueChange = {
+                            cfWorkerDomains = it
+                            scheduleSave()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !isRunning,
+                        minLines = 1,
+                        label = {
+                            Text(stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_domains))
+                        },
+                        placeholder = { Text("my-worker.username.workers.dev") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                        )
+                    )
+                    Text(
+                        stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_domains_hint),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

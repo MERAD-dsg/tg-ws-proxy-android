@@ -43,6 +43,14 @@ pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
 pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Сколько ждём первый ответ от Telegram после того, как клиент отправил
+/// данные. Если ответа нет — маршрут «полуживой»: WS/Cloudflare отдал 101,
+/// но MTProto через него не идёт. Telegram в этом случае висит на
+/// «Обновление...», поэтому сессию нужно закрыть и пометить маршрут плохим,
+/// чтобы следующая попытка ушла на другой домен/маршрут.
+pub const BRIDGE_FIRST_DOWNSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
+/// Шаг проверки «мёртвой» сессии.
+pub const BRIDGE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;
@@ -287,7 +295,7 @@ pub fn canonicalize_user_domain(raw: &str) -> Option<String> {
 /// Каноникализация записи из внешнего списка доменов.
 /// Записи с суффиксом ".com" — обфусцированный встроенный формат Flowseal
 /// (декодируется в ".co.uk"), остальное берётся как есть. Это позволяет
-/// смешивать в одном списке и encoded-домены, и обычные (dont-block-it.uk и т.п.).
+/// смешивать в одном списке и encoded-домены, и обычные (my-proxy.example.com и т.п.).
 pub fn canonicalize_pool_entry(raw: &str) -> Option<String> {
     let item = raw.trim().to_lowercase();
     if item.is_empty() {

@@ -40,6 +40,7 @@ class SettingsStore(private val context: Context) {
         val CUSTOM_CF_DOMAIN_ENABLED = booleanPreferencesKey("custom_cf_domain_enabled")
         val CUSTOM_CF_DOMAIN = stringPreferencesKey("custom_cf_domain")
         val CFPROXY_EXTRA_URLS = stringPreferencesKey("cfproxy_extra_urls")
+        val CF_WORKER_DOMAINS = stringPreferencesKey("cf_worker_domains")
         val DPI_BYPASS_ENABLED = booleanPreferencesKey("dpi_bypass_enabled")
         val UPSTREAM_PROXY_URL = stringPreferencesKey("upstream_proxy_url")
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
@@ -89,6 +90,8 @@ class SettingsStore(private val context: Context) {
     val customCfDomainEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN_ENABLED] ?: false }
     val customCfDomain: Flow<String> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN] ?: "" }
     val cfproxyExtraUrls: Flow<String> = context.dataStore.data.map { it[Keys.CFPROXY_EXTRA_URLS] ?: "" }
+    /** Свои Cloudflare Worker-домены (свой бесплатный worker вместо общего пула). */
+    val cfWorkerDomains: Flow<String> = context.dataStore.data.map { it[Keys.CF_WORKER_DOMAINS] ?: "" }
     val dpiBypassEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.DPI_BYPASS_ENABLED] ?: true }
     val upstreamProxyUrl: Flow<String> = context.dataStore.data.map { it[Keys.UPSTREAM_PROXY_URL] ?: "" }
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
@@ -199,7 +202,7 @@ class SettingsStore(private val context: Context) {
                         isExperimental: Boolean, bindIp: String, port: String, poolSize: Int,
                         cfproxyEnabled: Boolean, customCfDomainEnabled: Boolean, customCfDomain: String,
                         cfproxyExtraUrls: String, dpiBypassEnabled: Boolean, upstreamProxyUrl: String,
-                        secretKey: String) {
+                        secretKey: String, cfWorkerDomains: String = "") {
         context.dataStore.edit {
             it[Keys.IS_DC_AUTO] = isDcAuto
             it[Keys.DC1] = dc1
@@ -222,6 +225,7 @@ class SettingsStore(private val context: Context) {
             it[Keys.CUSTOM_CF_DOMAIN_ENABLED] = customCfDomainEnabled
             it[Keys.CUSTOM_CF_DOMAIN] = customCfDomain
             it[Keys.CFPROXY_EXTRA_URLS] = cfproxyExtraUrls
+            it[Keys.CF_WORKER_DOMAINS] = cfWorkerDomains
             it[Keys.DPI_BYPASS_ENABLED] = dpiBypassEnabled
             it[Keys.UPSTREAM_PROXY_URL] = upstreamProxyUrl
             it[Keys.SECRET_KEY] = secretKey

@@ -232,7 +232,7 @@ pub unsafe extern "C" fn SetCfProxyConfig(
 ) {
     CFPROXY_ENABLED.store(enabled != 0, Ordering::Relaxed);
     let user_domain = cstr_to_string(c_user_domain);
-    // Пользовательские домены используются КАК ЕСТЬ (dont-block-it.uk и т.п.),
+    // Пользовательские домены используются КАК ЕСТЬ (my-proxy.example.com и т.п.),
     // без decode .com -> .co.uk и без требования суффикса .co.uk.
     let list = coerce_domain_list_str(&user_domain);
     let user_domains = crate::cfproxy::merge_user_domains(&[list]);
@@ -360,7 +360,25 @@ pub extern "C" fn GetDomainsSummary() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SetCfWorkerDomains(c_domains: *const c_char) {
     let raw = cstr_to_string(c_domains);
-    *CF_WORKER_DOMAINS.write() = coerce_domain_list_str(&raw);
+    // Пользователь часто вставляет адрес целиком (https://…workers.dev/),
+    // поэтому нормализуем: схема/путь/порт отбрасываются, домен валидируется.
+    let mut domains: Vec<String> = Vec::new();
+    for item in coerce_domain_list_str(&raw) {
+        match crate::config::canonicalize_user_domain(&item) {
+            Some(d) => {
+                if !domains.contains(&d) {
+                    domains.push(d);
+                }
+            }
+            None => lwarn!(" worker: домен проигнорирован (некорректный): {}", item),
+        }
+    }
+    if !domains.is_empty() {
+        linfo!(" CF worker: задано доменов: {:?}", domains);
+        *CF_WORKER_DOMAINS.write() = domains;
+    } else if raw.trim().is_empty() {
+        *CF_WORKER_DOMAINS.write() = Vec::new();
+    }
 }
 
 /// # Safety

@@ -647,7 +647,8 @@ impl CfWorkerPool {
         fallback_dst: String,
         dc: i32,
     ) -> Option<(RawWebSocket, String)> {
-        let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
+        // Worker всегда по WSS: Cloudflare на порту 80 отдаёт редирект на HTTPS.
+        let secure = true;
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
         for worker_domain in self.available_domains(worker_domains).await {
@@ -787,6 +788,17 @@ pub fn is_http_transport(data: &[u8]) -> bool {
 // Сессионная статистика как в bridge_ws_reencrypt оригинала.
 // ---------------------------------------------------------------------------
 
+/// Итог WS-сессии: нужен, чтобы пометить маршрут плохим, если через него
+/// не пошёл трафик (Telegram «подключился», но висит на «Обновление...»).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BridgeOutcome {
+    pub up_bytes: i64,
+    pub down_bytes: i64,
+    /// Клиент отправил данные, но ответа от Telegram не было дольше
+    /// BRIDGE_FIRST_DOWNSTREAM_TIMEOUT — маршрут полуживой.
+    pub stalled: bool,
+}
+
 pub async fn bridge_ws<R, W>(
     conn_read: R,
     conn_write: W,
@@ -800,7 +812,8 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-) where
+) -> BridgeOutcome
+where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -809,6 +822,10 @@ pub async fn bridge_ws<R, W>(
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
     let cancel = Arc::new(tokio::sync::Notify::new());
     let start = now_monotonic();
+    // Метка «клиент что-то отправил» и «пришёл первый ответ».
+    let client_sent_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+    let got_downstream = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut conn_read = conn_read;
     let mut conn_write = conn_write;
@@ -838,6 +855,43 @@ pub async fn bridge_ws<R, W>(
         }
     });
 
+    // watchdog: клиент отправил данные, а ответа нет — маршрут мёртвый.
+    // Без этого Telegram остаётся в состоянии «Обновление...» навсегда,
+    // потому что WS-соединение формально живое (101 + ping/pong).
+    let watchdog_ws = ws.clone();
+    let watchdog_sent = client_sent_at.clone();
+    let watchdog_got = got_downstream.clone();
+    let watchdog_stalled = stalled.clone();
+    let watchdog_cancel = cancel.clone();
+    let watchdog_token = cancel_token.clone();
+    let watchdog_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(BRIDGE_WATCHDOG_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = watchdog_token.cancelled() => return,
+                _ = watchdog_cancel.notified() => return,
+                _ = ticker.tick() => {
+                    if watchdog_got.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let sent = *watchdog_sent.lock().await;
+                    if let Some(t) = sent {
+                        if t.elapsed() >= BRIDGE_FIRST_DOWNSTREAM_TIMEOUT {
+                            watchdog_stalled.store(true, Ordering::Relaxed);
+                            lwarn!(
+                                " WS session: нет ответа от Telegram {:.0}с после данных клиента — закрываю мёртвый маршрут",
+                                t.elapsed().as_secs_f64()
+                            );
+                            watchdog_ws.close().await;
+                            watchdog_cancel.notify_waiters();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // up: client -> ws
     let ws_up = ws.clone();
     let la_up = last_activity.clone();
@@ -849,6 +903,7 @@ pub async fn bridge_ws<R, W>(
     let up_packets_c = up_packets.clone();
     let close_reason_up = Arc::new(Mutex::new(String::new()));
     let close_reason_up_c = close_reason_up.clone();
+    let sent_at_up = client_sent_at.clone();
     let up_task = tokio::spawn(async move {
         let mut buf = vec![0u8; WS_BRIDGE_CHUNK_SIZE];
         loop {
@@ -884,6 +939,13 @@ pub async fn bridge_ws<R, W>(
                     break;
                 }
                 Err(_) => {
+                    // Таймаут чтения от клиента сам по себе не повод рвать
+                    // сессию: важна общая активность в обе стороны.
+                    // Иначе здоровые простаивающие сессии Telegram
+                    // переподключаются каждые 2 минуты.
+                    if la_up.lock().await.elapsed() < BRIDGE_READ_TIMEOUT {
+                        continue;
+                    }
                     *close_reason_up_c.lock().await = "client: timeout".to_string();
                     break;
                 }
@@ -916,6 +978,11 @@ pub async fn bridge_ws<R, W>(
                 *close_reason_up_c.lock().await = "upstream: send_failed".to_string();
                 break;
             }
+            // Запоминаем момент первой отправки — watchdog ждёт ответ.
+            let mut sent = sent_at_up.lock().await;
+            if sent.is_none() {
+                *sent = Some(std::time::Instant::now());
+            }
         }
         cancel_up.notify_waiters();
     });
@@ -931,6 +998,8 @@ pub async fn bridge_ws<R, W>(
     let down_packets_c = down_packets.clone();
     let close_reason_down = Arc::new(Mutex::new(String::new()));
     let close_reason_down_c = close_reason_down.clone();
+    let got_down_c = got_downstream.clone();
+    let stalled_down_c = stalled.clone();
     let down_task = tokio::spawn(async move {
         loop {
             let recv_res = tokio::select! {
@@ -941,8 +1010,12 @@ pub async fn bridge_ws<R, W>(
             let mut data = match recv_res {
                 Ok(d) => d,
                 Err(WsError::Timeout) => {
-                    *close_reason_down_c.lock().await =
-                        "upstream: timeout".to_string();
+                    // Закрытие по watchdog уже выставило stalled: причину
+                    // не перетираем, это и есть диагностика мёртвого маршрута.
+                    if !stalled_down_c.load(Ordering::Relaxed) {
+                        *close_reason_down_c.lock().await =
+                            "upstream: timeout".to_string();
+                    }
                     break;
                 }
                 Err(_) => {
@@ -955,6 +1028,9 @@ pub async fn bridge_ws<R, W>(
                 }
             };
             let n = data.len();
+            if n > 0 {
+                got_down_c.store(true, Ordering::Relaxed);
+            }
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             down_packets_c.fetch_add(1, Ordering::Relaxed);
@@ -974,11 +1050,15 @@ pub async fn bridge_ws<R, W>(
     let _ = down_task.await;
     cancel.notify_waiters();
     ping_task.abort();
+    watchdog_task.abort();
 
+    let was_stalled = stalled.load(Ordering::Relaxed);
     let close_reason = {
         let up_r = close_reason_up.lock().await.clone();
         let down_r = close_reason_down.lock().await.clone();
-        if !down_r.is_empty() {
+        if was_stalled {
+            "upstream: no_downstream".to_string()
+        } else if !down_r.is_empty() {
             down_r
         } else if !up_r.is_empty() {
             up_r
@@ -1002,6 +1082,11 @@ pub async fn bridge_ws<R, W>(
     );
 
     ws.close().await;
+    BridgeOutcome {
+        up_bytes: up_bytes.load(Ordering::Relaxed),
+        down_bytes: down_bytes.load(Ordering::Relaxed),
+        stalled: was_stalled,
+    }
 }
 
 /// Совместимость: bridge по TcpStream (разрезаем внутри).
@@ -1049,11 +1134,16 @@ pub async fn bridge_tcp<CR, CW>(
     tg_enc: TrackedStream,
     tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-) where
+) -> bool
+where
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
 {
     let (mut r_read, mut r_write) = remote.split();
+    // Те же метрики, что и в WS-мосте: нужен детект «соединились, а данных нет».
+    let client_sent = Arc::new(AtomicBool::new(false));
+    let got_downstream = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::new(AtomicBool::new(false));
 
     let clt_dec = Arc::new(Mutex::new(clt_dec));
     let clt_enc = Arc::new(Mutex::new(clt_enc));
@@ -1066,6 +1156,7 @@ pub async fn bridge_tcp<CR, CW>(
     let cancel_token_up = cancel_token.clone();
     let clt_dec_up = clt_dec.clone();
     let tg_enc_up = tg_enc.clone();
+    let client_sent_up = client_sent.clone();
     let up = async move {
         let mut buf = vec![0u8; 131072];
         loop {
@@ -1085,6 +1176,7 @@ pub async fn bridge_tcp<CR, CW>(
             if r_write.write_all(chunk).await.is_err() {
                 break;
             }
+            client_sent_up.store(true, Ordering::Relaxed);
         }
         cancel_up.notify_waiters();
     };
@@ -1093,6 +1185,7 @@ pub async fn bridge_tcp<CR, CW>(
     let cancel_token_down = cancel_token.clone();
     let tg_dec_down = tg_dec.clone();
     let clt_enc_down = clt_enc.clone();
+    let got_down_down = got_downstream.clone();
     let down = async move {
         let mut buf = vec![0u8; 131072];
         loop {
@@ -1107,6 +1200,7 @@ pub async fn bridge_tcp<CR, CW>(
             };
             let chunk = &mut buf[..n];
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
+            got_down_down.store(true, Ordering::Relaxed);
             tg_dec_down.lock().await.xor(chunk);
             clt_enc_down.lock().await.xor(chunk);
             if c_write.write_all(chunk).await.is_err() {
@@ -1116,8 +1210,39 @@ pub async fn bridge_tcp<CR, CW>(
         cancel_down.notify_waiters();
     };
 
-    tokio::join!(up, down);
+    let cancel_wd = cancel.clone();
+    let cancel_token_wd = cancel_token.clone();
+    let sent_wd = client_sent.clone();
+    let got_wd = got_downstream.clone();
+    let stalled_wd = stalled.clone();
+    let watchdog = async move {
+        let mut first_sent: Option<std::time::Instant> = None;
+        let mut ticker = tokio::time::interval(BRIDGE_WATCHDOG_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = cancel_token_wd.cancelled() => return,
+                _ = cancel_wd.notified() => return,
+                _ = ticker.tick() => {
+                    if got_wd.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if sent_wd.load(Ordering::Relaxed) {
+                        let since = *first_sent.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= BRIDGE_FIRST_DOWNSTREAM_TIMEOUT {
+                            stalled_wd.store(true, Ordering::Relaxed);
+                            lwarn!(" TCP-туннель: нет ответа от Telegram {:.0}с — закрываю", since.elapsed().as_secs_f64());
+                            cancel_wd.notify_waiters();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::join!(up, down, watchdog);
     let _ = (clt_dec, clt_enc, tg_enc, tg_dec);
+    stalled.load(Ordering::Relaxed)
 }
 
 pub async fn bridge_tcp_stream(
@@ -1130,7 +1255,7 @@ pub async fn bridge_tcp_stream(
     cancel_token: CancellationToken,
 ) {
     let (c_read, c_write) = tokio::io::split(client);
-    bridge_tcp(
+    let _ = bridge_tcp(
         c_read,
         c_write,
         remote,
@@ -1176,7 +1301,7 @@ where
         return false;
     }
     let (clt_dec, clt_enc, tg_enc, tg_dec) = ctx_streams;
-    bridge_tcp(
+    let stalled = bridge_tcp(
         conn_read,
         conn_write,
         remote,
@@ -1187,6 +1312,18 @@ where
         cancel_token,
     )
     .await;
+    if stalled {
+        // Прямой TCP до DC «соединился», но ответа нет: DPI/блокировка.
+        // Помечаем IP, чтобы следующие соединения не залипали на нём.
+        let now = now_monotonic();
+        IP_FAIL_UNTIL
+            .write()
+            .insert(dst.to_string(), now + IP_FAIL_COOLDOWN);
+        lwarn!(
+            "[{}] TCP fallback {}:{} без downstream -> IP в cooldown",
+            label, dst, port
+        );
+    }
     true
 }
 
@@ -1414,14 +1551,18 @@ where
             .cf_worker
             .get(dc, fallback_dst.clone(), worker_domains.clone())
             .await;
+        let mut used_worker_domain = String::new();
         let worker_ws = if let Some((ws, worker_domain)) = pooled {
             linfo!(
                 "[{}] DC{}{} -> CF worker pool hit via {} for {}",
                 label, dc, m_tag, worker_domain, fallback_dst
             );
+            used_worker_domain = worker_domain;
             Some(ws)
         } else {
-            let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
+            // Workers.dev на порту 80 отвечает редиректом на HTTPS, поэтому
+            // для своего воркера всегда используем wss:// (443).
+            let secure = true;
             let query = format!("dst={}&dc={}", fallback_dst, dc);
             let path = format!("/apiws?{}", query);
             let mut found = None;
@@ -1441,6 +1582,7 @@ where
                 .await
                 {
                     Ok(ws) => {
+                        used_worker_domain = worker_domain.clone();
                         found = Some(ws);
                         break;
                     }
@@ -1458,7 +1600,7 @@ where
         if let Some(ws) = worker_ws {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             if ws.send(relay_init).await.is_ok() {
-                bridge_ws(
+                let outcome = bridge_ws(
                     conn_read,
                     conn_write,
                     ws,
@@ -1470,9 +1612,18 @@ where
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
-                cancel_token,
+                    cancel_token,
                 )
                 .await;
+                if outcome.stalled {
+                    // Worker отдал 101, но MTProto через него не пошёл —
+                    // уводим этот worker в cooldown, чтобы не залипать.
+                    mark_domain_fail(&used_worker_domain);
+                    lwarn!(
+                        " DC{}{} worker {} без downstream — в cooldown",
+                        dc, m_tag, used_worker_domain
+                    );
+                }
                 return true;
             }
             ws.close().await;
@@ -1482,14 +1633,14 @@ where
 
     // Шаг 2: cf-ws (без halves).
     if use_cf {
-        if let Some((ws, _chosen_domain)) =
+        if let Some((ws, chosen_domain)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             linfo!(" DC{}{} подключен через CF", dc, m_tag);
 
             if ws.send(relay_init).await.is_ok() {
-                bridge_ws(
+                let outcome = bridge_ws(
                     conn_read,
                     conn_write,
                     ws,
@@ -1504,6 +1655,13 @@ where
                     cancel_token,
                 )
                 .await;
+                if outcome.stalled {
+                    mark_domain_fail(&chosen_domain);
+                    lwarn!(
+                        " DC{}{} CF {} без downstream — домен в cooldown",
+                        dc, m_tag, chosen_domain
+                    );
+                }
                 return true;
             }
             ws.close().await;
@@ -1819,15 +1977,25 @@ async fn serve_core<R, W>(
     } else {
         IP_FAIL_UNTIL.read().get(&target).map(|until| now < *until).unwrap_or(false)
     };
+    // Свой Cloudflare Worker — самый предсказуемый маршрут (личные лимиты,
+    // нет общих 429). Если он настроен, идём в fallback сразу, не дожидаясь,
+    // пока прямой WS «полуподключится» и зависнет.
+    let has_own_worker = !CF_WORKER_DOMAINS.read().is_empty();
+    let prefer_worker = has_own_worker && !is_test_dc;
     let is_any_cf_fallback =
-        CFPROXY_ENABLED.load(Ordering::Relaxed) || !CF_WORKER_DOMAINS.read().is_empty();
+        CFPROXY_ENABLED.load(Ordering::Relaxed) || has_own_worker;
 
     // Fallback если DC нет в конфиге, WS в чёрном списке или IP на cooldown —
     // порт ветки из _handle_client оригинала.
     let mut pooled_ws: Option<RawWebSocket> = None;
     let mut use_pooled_direct = false;
-    if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) {
-        if !dc_configured {
+    if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) || prefer_worker {
+        if prefer_worker && dc_configured && !blacklisted {
+            linfo!(
+                "[{}] DC{}{} -> свой Cloudflare Worker (приоритет)",
+                label, dc, m_tag
+            );
+        } else if !dc_configured {
             linfo!("[{}] DC{} not in config -> fallback", label, dc);
         } else if blacklisted {
             linfo!("[{}] DC{}{} WS blacklisted -> fallback", label, dc, m_tag);
@@ -2098,7 +2266,7 @@ async fn serve_core<R, W>(
     let _ = send_ok;
 
     DC_FAIL_UNTIL.write().remove(&dc_key);
-    bridge_ws(
+    let outcome = bridge_ws(
         conn_read,
         conn_write,
         ws,
@@ -2113,6 +2281,22 @@ async fn serve_core<R, W>(
         cancel_token,
     )
     .await;
+    if outcome.stalled {
+        // Прямой WS принял handshake, но данных от DC нет — типичная
+        // картина «подключился и вечное Обновление». Помечаем DC/IP
+        // упавшими, чтобы следующее соединение ушло на CF/worker/TCP.
+        let now2 = now_monotonic();
+        DC_FAIL_UNTIL.write().insert(dc_key, now2 + DC_FAIL_COOLDOWN);
+        if !target.is_empty() {
+            IP_FAIL_UNTIL
+                .write()
+                .insert(target.clone(), now2 + IP_FAIL_COOLDOWN);
+        }
+        lwarn!(
+            "[{}] DC{}{} прямой WS без downstream -> DC в cooldown",
+            label, dc, m_tag
+        );
+    }
 }
 
 // connectDirectWS — прямой перебор доменов (тихий, для retry-пути).

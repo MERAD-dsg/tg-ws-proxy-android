@@ -42,6 +42,7 @@ class ProxyService : Service() {
     private var lastCfPriority: Boolean = true
     private var lastCfDomain: String = ""
     private var lastCfExtraUrls: String = ""
+    private var lastCfWorkerDomains: String = ""
     private var lastDpiBypass: Boolean = true
     private var lastUpstreamProxy: String = ""
     private var lastSecretKey: String = ""
@@ -58,6 +59,7 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
         const val EXTRA_CFPROXY_EXTRA_URLS = "EXTRA_CFPROXY_EXTRA_URLS"
+        const val EXTRA_CF_WORKER_DOMAINS = "EXTRA_CF_WORKER_DOMAINS"
         const val EXTRA_DPI_BYPASS = "EXTRA_DPI_BYPASS"
         const val EXTRA_UPSTREAM_PROXY = "EXTRA_UPSTREAM_PROXY"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
@@ -98,11 +100,12 @@ class ProxyService : Service() {
                 val cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true)
                 val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
                 val cfExtraUrls = intent.getStringExtra(EXTRA_CFPROXY_EXTRA_URLS) ?: ""
+                val cfWorkerDomains = intent.getStringExtra(EXTRA_CF_WORKER_DOMAINS) ?: ""
                 val dpiBypass = intent.getBooleanExtra(EXTRA_DPI_BYPASS, true)
                 val upstreamProxy = intent.getStringExtra(EXTRA_UPSTREAM_PROXY) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
                 startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain,
-                    cfExtraUrls, dpiBypass, upstreamProxy, secretKey)
+                    cfExtraUrls, dpiBypass, upstreamProxy, secretKey, cfWorkerDomains)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -116,7 +119,7 @@ class ProxyService : Service() {
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
                     startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain,
-                        lastCfExtraUrls, lastDpiBypass, lastUpstreamProxy, lastSecretKey)
+                        lastCfExtraUrls, lastDpiBypass, lastUpstreamProxy, lastSecretKey, lastCfWorkerDomains)
                 } else {
                     stopSelf()
                 }
@@ -145,7 +148,7 @@ class ProxyService : Service() {
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
                            cfDomain: String = "", cfExtraUrls: String = "",
                            dpiBypass: Boolean = true, upstreamProxy: String = "",
-                           secretKey: String = "") {
+                           secretKey: String = "", cfWorkerDomains: String = "") {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -158,6 +161,7 @@ class ProxyService : Service() {
         lastCfPriority = cfPriority
         lastCfDomain = cfDomain
         lastCfExtraUrls = cfExtraUrls
+        lastCfWorkerDomains = cfWorkerDomains
         lastDpiBypass = dpiBypass
         lastUpstreamProxy = upstreamProxy
         lastSecretKey = secretKey
@@ -197,6 +201,7 @@ class ProxyService : Service() {
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
                 NativeProxy.setCfProxyExtraUrls(cfExtraUrls)
+                NativeProxy.setCfWorkerDomains(cfWorkerDomains.trim())
                 NativeProxy.setUpstreamProxy(upstreamProxy.trim())
                 NativeProxy.setDpiBypass(dpiBypass)
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
@@ -310,7 +315,8 @@ class ProxyService : Service() {
                 cfExtraUrls = lastCfExtraUrls,
                 dpiBypass = lastDpiBypass,
                 upstreamProxy = lastUpstreamProxy,
-                secretKey = lastSecretKey
+                secretKey = lastSecretKey,
+                cfWorkerDomains = lastCfWorkerDomains
             )
         }
     }

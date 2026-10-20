@@ -70,7 +70,7 @@ pub fn merge_cfproxy_domains(lists: &[Vec<String>]) -> Vec<String> {
     for list in lists {
         for raw in list {
             // Записи из внешних списков каноникализируем: encoded (.com)
-            // декодируется, обычные домены (dont-block-it.uk и т.п.) берутся
+            // декодируется, обычные домены (my-proxy.example.com и т.п.) берутся
             // как есть.
             let d = match crate::config::canonicalize_pool_entry(raw) {
                 Some(d) => d,
@@ -725,14 +725,14 @@ mod tests {
         // encoded .com декодируется
         let enc = canonicalize_pool_entry("virkgj.com").unwrap();
         assert!(enc.ends_with(".co.uk"));
-        // обычный домен (в т.ч. вида dont-block-it.uk) берётся как есть
+        // обычный домен (в т.ч. вида my-proxy.example.com) берётся как есть
         assert_eq!(
-            canonicalize_pool_entry("dont-block-it.uk").unwrap(),
-            "dont-block-it.uk"
+            canonicalize_pool_entry("my-proxy.example.com").unwrap(),
+            "my-proxy.example.com"
         );
         assert_eq!(
             canonicalize_pool_entry("DONT-BLOCK-IT.UK").unwrap(),
-            "dont-block-it.uk"
+            "my-proxy.example.com"
         );
         assert!(canonicalize_pool_entry("not a domain!!").is_none());
         assert!(canonicalize_pool_entry("").is_none());
@@ -741,8 +741,8 @@ mod tests {
     #[test]
     fn user_domains_as_is() {
         assert_eq!(
-            canonicalize_user_domain("dont-block-it.uk").unwrap(),
-            "dont-block-it.uk"
+            canonicalize_user_domain("my-proxy.example.com").unwrap(),
+            "my-proxy.example.com"
         );
         assert_eq!(
             canonicalize_user_domain("https://MyProxy.example.com/path").unwrap(),
@@ -758,6 +758,15 @@ mod tests {
             "virkgj.com"
         );
         assert!(canonicalize_user_domain("no").is_none());
+        // Свой Cloudflare Worker: адрес можно вставлять целиком.
+        assert_eq!(
+            canonicalize_user_domain("my-worker.username.workers.dev").unwrap(),
+            "my-worker.username.workers.dev"
+        );
+        assert_eq!(
+            canonicalize_user_domain("https://my-worker.username.workers.dev/apiws?x=1").unwrap(),
+            "my-worker.username.workers.dev"
+        );
     }
 
     #[test]
