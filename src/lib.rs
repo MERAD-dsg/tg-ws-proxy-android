@@ -232,7 +232,7 @@ pub unsafe extern "C" fn SetCfProxyConfig(
 ) {
     CFPROXY_ENABLED.store(enabled != 0, Ordering::Relaxed);
     let user_domain = cstr_to_string(c_user_domain);
-    // Пользовательские домены используются КАК ЕСТЬ (my-proxy.example.com и т.п.),
+    // Пользовательские домены используются КАК ЕСТЬ (my-proxy.example.org и т.п.),
     // без decode .com -> .co.uk и без требования суффикса .co.uk.
     let list = coerce_domain_list_str(&user_domain);
     let user_domains = crate::cfproxy::merge_user_domains(&[list]);

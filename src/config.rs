@@ -295,7 +295,7 @@ pub fn canonicalize_user_domain(raw: &str) -> Option<String> {
 /// Каноникализация записи из внешнего списка доменов.
 /// Записи с суффиксом ".com" — обфусцированный встроенный формат Flowseal
 /// (декодируется в ".co.uk"), остальное берётся как есть. Это позволяет
-/// смешивать в одном списке и encoded-домены, и обычные (my-proxy.example.com и т.п.).
+/// смешивать в одном списке и encoded-домены, и обычные (my-proxy.example.org и т.п.).
 pub fn canonicalize_pool_entry(raw: &str) -> Option<String> {
     let item = raw.trim().to_lowercase();
     if item.is_empty() {
