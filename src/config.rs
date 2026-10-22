@@ -19,7 +19,9 @@ pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
 pub const WS_FAIL_TIMEOUT: f64 = 2.0;
 // Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
-pub const WS_DIRECT_TIMEOUT: f64 = 5.0;
+// 3 с вместо 5: быстрее переключаемся на резервный маршрут, если прямой
+// WS не поднялся. Это заметно уменьшает «залипание» на «Подключении…».
+pub const WS_DIRECT_TIMEOUT: f64 = 3.0;
 
 // proxy/utils.py — MTProto handshake layout
 pub const HANDSHAKE_LEN: usize = 64;
@@ -41,8 +43,18 @@ pub const PROTO_PADDED_INTERMEDIATE_INT: u32 = 0xDDDDDDDD;
 // proxy/utils.py — зарезервированные префиксы relay_init
 pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
-pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
-pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
+// Потолок простоя сессии. Раньше здесь было 120 с: если мобильная сеть
+// «съедала» TCP-соединение (типичный обрыв на LTE/переключении Wi-Fi), прокси
+// узнавал об этом только через 2 минуты — всё это время Telegram показывал
+// «Подключение прокси…» и сообщения не грузились. Теперь живость проверяется
+// пингами и ответом на них (см. BRIDGE_PONG_TIMEOUT), поэтому общий таймаут
+// можно держать коротким.
+pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(45);
+/// Период app-level ping в активной сессии (WebSocket ping + pong).
+pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(12);
+/// Сколько ждём pong/любой ответ после нашего ping. Нет ответа — соединение
+/// мертво (TCP-blackhole на мобильной сети), закрываем сразу.
+pub const BRIDGE_PONG_TIMEOUT: Duration = Duration::from_secs(6);
 /// Сколько ждём первый ответ от Telegram после того, как клиент отправил
 /// данные. Если ответа нет — маршрут «полуживой»: WS/Cloudflare отдал 101,
 /// но MTProto через него не идёт. Telegram в этом случае висит на
@@ -83,7 +95,7 @@ pub const CFPROXY_MIN_VALID_DOMAINS: usize = 3;
 // из ротации, чтобы мёртвые домены не съедали время подключения.
 pub const DOMAIN_FAIL_COOLDOWN_INITIAL: Duration = Duration::from_secs(30);
 pub const DOMAIN_FAIL_COOLDOWN_MAX: Duration = Duration::from_secs(1800);
-pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(4);
+pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CFPROXY_FALLBACK_PARALLEL: usize = 2;
 pub const CFPROXY_429_COOLDOWN: Duration = Duration::from_secs(45);
 pub const CFPROXY_429_MAX_COOLDOWN: Duration = Duration::from_secs(300);
@@ -422,6 +434,125 @@ pub fn cf_circuit_note_failure() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RTT / здоровье маршрутов
+// ---------------------------------------------------------------------------
+
+/// Записать измеренный RTT (мс): мгновенное значение + сглаженное среднее.
+/// Сглаживание (EWMA 0.3) — чтобы «прыгающий» пинг в UI не мигал с 40 на 4000.
+pub fn record_ping_rtt(ms: u64) {
+    if ms == 0 || ms > 120_000 {
+        return;
+    }
+    STATS.ping_ms.store(ms as i64, Ordering::Relaxed);
+    let prev = STATS.ping_avg_ms.load(Ordering::Relaxed);
+    let next = if prev <= 0 {
+        ms as i64
+    } else {
+        (prev * 7 + ms as i64 * 3) / 10
+    };
+    STATS.ping_avg_ms.store(next, Ordering::Relaxed);
+}
+
+/// Маршрут до Telegram. Код идёт в статистику (`route=`), чтобы UI показывал,
+/// через что сейчас идёт трафик.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    Direct = 1,
+    Worker = 2,
+    CfPool = 3,
+    Tcp = 4,
+}
+
+impl RouteKind {
+    pub fn code(self) -> i64 {
+        self as i64
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RouteKind::Direct => "direct-ws",
+            RouteKind::Worker => "worker",
+            RouteKind::CfPool => "cf-pool",
+            RouteKind::Tcp => "tcp",
+        }
+    }
+
+    pub fn from_code(v: i64) -> Option<RouteKind> {
+        match v {
+            1 => Some(RouteKind::Direct),
+            2 => Some(RouteKind::Worker),
+            3 => Some(RouteKind::CfPool),
+            4 => Some(RouteKind::Tcp),
+            _ => None,
+        }
+    }
+}
+
+/// «Липкий» лучший маршрут для DC: если прямой WS недавно работал, незачем
+/// каждый раз сначала тратить время на Cloudflare (и наоборот).
+#[derive(Debug, Clone, Copy)]
+pub struct RouteHealth {
+    pub best: RouteKind,
+    /// when_monotonic последнего успеха
+    pub best_at: f64,
+    /// когда маршрут был помечен плохим (0 — не был)
+    pub bad_at: f64,
+}
+
+pub static ROUTE_HEALTH: Lazy<RwLock<HashMap<i32, RouteHealth>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Сколько «липкий» маршрут считается свежим.
+pub const ROUTE_STICKY_TTL: f64 = 900.0;
+/// Сколько маршрут считается плохим после мёртвой сессии.
+pub const ROUTE_BAD_TTL: f64 = 120.0;
+
+pub fn route_mark_good(dc: i32, route: RouteKind) {
+    let mut map = ROUTE_HEALTH.write();
+    let entry = map.entry(dc).or_insert(RouteHealth {
+        best: route,
+        best_at: 0.0,
+        bad_at: 0.0,
+    });
+    entry.best = route;
+    entry.best_at = now_monotonic();
+    entry.bad_at = 0.0;
+    STATS.last_route.store(route.code(), Ordering::Relaxed);
+}
+
+pub fn route_mark_bad(dc: i32, route: RouteKind) {
+    let mut map = ROUTE_HEALTH.write();
+    let entry = map.entry(dc).or_insert(RouteHealth {
+        best: route,
+        best_at: 0.0,
+        bad_at: 0.0,
+    });
+    entry.bad_at = now_monotonic();
+    entry.best_at = 0.0;
+}
+
+/// Свежий рабочий маршрут для DC (или None, если истории нет / она устарела).
+pub fn route_preferred(dc: i32) -> Option<RouteKind> {
+    let map = ROUTE_HEALTH.read();
+    let h = map.get(&dc)?;
+    let now = now_monotonic();
+    if h.best_at > 0.0 && now - h.best_at <= ROUTE_STICKY_TTL {
+        Some(h.best)
+    } else {
+        None
+    }
+}
+
+/// Маршрут недавно «умирал» (нет pong / нет downstream)?
+pub fn route_recently_bad(dc: i32, route: RouteKind) -> bool {
+    let map = ROUTE_HEALTH.read();
+    match map.get(&dc) {
+        Some(h) => h.bad_at > 0.0 && now_monotonic() - h.bad_at <= ROUTE_BAD_TTL && h.best != route,
+        None => false,
+    }
+}
+
 /// Сколько раз в текущем окне маршрут Cloudflare был пропущен (для логов).
 pub static CF_SKIPPED_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -668,6 +799,14 @@ pub struct Stats {
     pub pool_misses: AtomicI64,
     pub cf_pool_hits: AtomicI64,
     pub cf_pool_misses: AtomicI64,
+    /// Последний измеренный RTT пинга через активный WS (мс).
+    pub ping_ms: AtomicI64,
+    /// Скользящее среднее RTT (мс) — сглаживает «скачущий» пинг.
+    pub ping_avg_ms: AtomicI64,
+    /// Сколько раз сессия закрывалась по мёртвому маршруту (нет pong/данных).
+    pub dead_sessions: AtomicI64,
+    /// Код текущего маршрута: 0 неизвестен, 1 прямой WS, 2 worker, 3 CF, 4 TCP.
+    pub last_route: AtomicI64,
 }
 
 pub static STATS: Lazy<Stats> = Lazy::new(Stats::default);
@@ -705,6 +844,12 @@ impl Stats {
             cf_pool_s,
             human_bytes(self.bytes_up.load(Ordering::Relaxed)),
             human_bytes(self.bytes_down.load(Ordering::Relaxed)),
+        ) + &format!(
+            " ping={} ping_avg={} dead={} route={}",
+            self.ping_ms.load(Ordering::Relaxed),
+            self.ping_avg_ms.load(Ordering::Relaxed),
+            self.dead_sessions.load(Ordering::Relaxed),
+            self.last_route.load(Ordering::Relaxed),
         )
     }
 
@@ -965,5 +1110,31 @@ mod secret_tests {
         assert!(bad_handshake_log_gate(0).is_some());
         // окно 60 секунд — повтор сразу после первого подавляется
         assert!(bad_handshake_log_gate(60).is_none());
+    }
+
+    #[test]
+    fn route_health_prefers_last_good() {
+        let dc = 991;
+        assert_eq!(route_preferred(dc), None);
+        route_mark_good(dc, RouteKind::Worker);
+        assert_eq!(route_preferred(dc), Some(RouteKind::Worker));
+        route_mark_good(dc, RouteKind::Direct);
+        assert_eq!(route_preferred(dc), Some(RouteKind::Direct));
+        route_mark_bad(dc, RouteKind::Direct);
+        assert_eq!(route_preferred(dc), None);
+        assert!(route_recently_bad(dc, RouteKind::Worker));
+    }
+
+    #[test]
+    fn ping_rtt_is_smoothed() {
+        let before = STATS.ping_avg_ms.load(Ordering::Relaxed);
+        record_ping_rtt(100);
+        let first = STATS.ping_avg_ms.load(Ordering::Relaxed);
+        record_ping_rtt(1000);
+        let second = STATS.ping_avg_ms.load(Ordering::Relaxed);
+        // Одиночный выброс не должен утащить среднее сразу к 1000 мс.
+        assert!(second > first, "avg must grow");
+        assert!(second < 900, "avg must stay smoothed: {}", second);
+        STATS.ping_avg_ms.store(before, Ordering::Relaxed);
     }
 }

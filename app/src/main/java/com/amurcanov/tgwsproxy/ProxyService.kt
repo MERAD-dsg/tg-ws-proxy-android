@@ -268,14 +268,16 @@ class ProxyService : Service() {
                 delay(STATS_UPDATE_MS.milliseconds)
                 if (_isRunning.value && !stopInProgress) {
                     try {
-                        val rawStats = NativeProxy.getStats() ?: continue
-                        val upRaw = extractStat(rawStats, "up=")
-                        val downRaw = extractStat(rawStats, "down=")
-                        val activeConns = extractStat(rawStats, "active=")
-                        
-                        val totalBytes = parseHumanBytes(upRaw) + parseHumanBytes(downRaw)
-                        val active = activeConns.toIntOrNull() ?: 0
-                        val text = getString(R.string.notification_traffic, formatBytes(totalBytes), active)
+                        val stats = NativeProxy.parseStats(NativeProxy.getStats() ?: continue)
+                        val totalBytes = parseHumanBytes(stats.up) + parseHumanBytes(stats.down)
+                        // В уведомлении — только ping и число соединений:
+                        // строка обновляется раз в пару секунд и не должна прыгать.
+                        val text = getString(
+                            R.string.notification_traffic_ping,
+                            formatBytes(totalBytes),
+                            stats.active,
+                            if (stats.hasPing) stats.pingAvgMs else 0
+                        )
                         updateNotification(text)
                     } catch (e: Exception) {
                         Log.w(TAG, "Stats update failed", e)
@@ -364,14 +366,6 @@ class ProxyService : Service() {
         }
     }
 
-    private fun extractStat(stats: String, key: String): String {
-        val idx = stats.indexOf(key)
-        if (idx == -1) return "0B"
-        val start = idx + key.length
-        val end = stats.indexOf(" ", start)
-        return if (end == -1) stats.substring(start) else stats.substring(start, end)
-    }
-    
     private fun parseHumanBytes(s: String): Double {
         val num = s.replace(Regex("[^0-9.]"), "").toDoubleOrNull() ?: 0.0
         return when {

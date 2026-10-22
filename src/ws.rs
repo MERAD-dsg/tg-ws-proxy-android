@@ -10,7 +10,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -194,6 +194,10 @@ pub struct RawWebSocket {
     frag: tokio::sync::Mutex<Vec<u8>>,
     pub closed: AtomicBool,
     pub secure: bool,
+    /// Последний измеренный RTT ping→pong, мс (0 — ещё не мерили).
+    rtt_ms: AtomicU64,
+    /// Монотонное время (мс) последнего ЛЮБОГО входящего фрейма.
+    last_rx_ms: AtomicU64,
 }
 
 impl RawWebSocket {
@@ -218,31 +222,82 @@ impl RawWebSocket {
         if self.is_closed() {
             return Err(WsError::Other("WebSocket closed".to_string()));
         }
-        let mut writer = self.writer.lock().await;
+        // Один общий буфер → один write → одна TLS-запись и один сисколл
+        // вместо N. На мобильной сети это заметно снижает задержку и
+        // количество исходящих пакетов (джиттер, расход батареи).
+        let mut joined: Vec<u8> = Vec::with_capacity(
+            parts.iter().map(|p| p.len() + 14).sum::<usize>(),
+        );
         for part in parts {
-            let frame = build_frame(OP_BINARY, part, true);
-            let res = tokio::time::timeout(WS_WRITE_TIMEOUT, write_all_match(&mut writer, &frame)).await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    self.closed.store(true, Ordering::Relaxed);
-                    return Err(WsError::Io(e));
-                }
-                Err(_) => {
-                    self.closed.store(true, Ordering::Relaxed);
-                    return Err(WsError::Timeout);
-                }
+            joined.extend_from_slice(&build_frame(OP_BINARY, part, true));
+        }
+        let mut writer = self.writer.lock().await;
+        let res = tokio::time::timeout(WS_WRITE_TIMEOUT, write_all_match(&mut writer, &joined)).await;
+        match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.closed.store(true, Ordering::Relaxed);
+                Err(WsError::Io(e))
+            }
+            Err(_) => {
+                self.closed.store(true, Ordering::Relaxed);
+                Err(WsError::Timeout)
             }
         }
-        Ok(())
     }
 
     pub async fn send_ping(&self) -> Result<(), WsError> {
+        // Пустой payload: RTT не померить, но сервер обязан ответить pong.
         if self.is_closed() {
             return Err(WsError::Other("WebSocket closed".to_string()));
         }
         let frame = build_frame(OP_PING, &[], true);
         self.write_frame(&frame, WS_CONTROL_TIMEOUT).await
+    }
+
+    /// Ping с меткой времени в payload: сервер вернёт её же в pong
+    /// (RFC 6455 §5.5.3), и мы посчитаем точный RTT маршрута.
+    pub async fn send_ping_ts(&self) -> Result<u64, WsError> {
+        if self.is_closed() {
+            return Err(WsError::Other("WebSocket closed".to_string()));
+        }
+        let ts = mono_ms();
+        let frame = build_frame(OP_PING, &ts.to_be_bytes(), true);
+        self.write_frame(&frame, WS_CONTROL_TIMEOUT).await?;
+        Ok(ts)
+    }
+
+    /// Последний измеренный RTT, мс (0 — ещё не измеряли).
+    pub fn rtt_ms(&self) -> u64 {
+        self.rtt_ms.load(Ordering::Relaxed)
+    }
+
+    /// Монотонное время последнего входящего фрейма, мс.
+    pub fn last_rx_ms(&self) -> u64 {
+        self.last_rx_ms.load(Ordering::Relaxed)
+    }
+
+    fn note_inbound(&self) {
+        self.last_rx_ms.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    /// Обработать pong: если payload — наша метка, посчитать RTT.
+    fn note_pong(&self, payload: &[u8]) {
+        self.note_inbound();
+        if payload.len() == 8 {
+            let sent = u64::from_be_bytes([
+                payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                payload[6], payload[7],
+            ]);
+            let now = mono_ms();
+            if now >= sent {
+                let rtt = now - sent;
+                if rtt > 0 && rtt < 120_000 {
+                    self.rtt_ms.store(rtt, Ordering::Relaxed);
+                    crate::config::record_ping_rtt(rtt);
+                }
+            }
+        }
     }
 
     async fn write_frame(&self, frame: &[u8], timeout: Duration) -> Result<(), WsError> {
@@ -281,6 +336,7 @@ impl RawWebSocket {
                     return Err(e);
                 }
             };
+            self.note_inbound();
             match opcode {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
@@ -302,7 +358,10 @@ impl RawWebSocket {
                     let _ = self.write_frame(&pong, WS_CONTROL_TIMEOUT).await;
                     continue;
                 }
-                OP_PONG => continue,
+                OP_PONG => {
+                    self.note_pong(&payload);
+                    continue;
+                }
                 OP_CONT | OP_TEXT | OP_BINARY => {
                     let mut frag = self.frag.lock().await;
                     if fin && frag.is_empty() {
@@ -361,6 +420,7 @@ impl RawWebSocket {
                     Err(_) => return Err(WsError::Timeout),
                 }
             };
+            self.note_inbound();
             let (opcode, payload, fin) = frame;
             match opcode {
                 OP_CLOSE => {
@@ -381,8 +441,12 @@ impl RawWebSocket {
                     let _ = self.write_frame(&pong, WS_CONTROL_TIMEOUT).await;
                     continue;
                 }
-                OP_PONG => continue,
+                OP_PONG => {
+                    self.note_pong(&payload);
+                    continue;
+                }
                 OP_CONT | OP_TEXT | OP_BINARY => {
+                    self.note_inbound();
                     let mut frag = self.frag.lock().await;
                     if fin && frag.is_empty() {
                         return Ok(payload);
@@ -589,6 +653,12 @@ fn set_sock_opts(stream: &TcpStream) {
     }
 }
 
+/// Монотонное время процесса в миллисекундах (для RTT и живости).
+pub fn mono_ms() -> u64 {
+    static START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
 pub fn ws_connect_timeout(timeout: f64) -> Duration {
     if timeout <= 0.0 {
         Duration::from_secs(5)
@@ -642,6 +712,8 @@ async fn handshake_tls(
             frag: tokio::sync::Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             secure: true,
+            rtt_ms: AtomicU64::new(0),
+            last_rx_ms: AtomicU64::new(mono_ms()),
         });
     }
     let location = headers.get("location").cloned().unwrap_or_default();
@@ -682,6 +754,8 @@ async fn handshake_plain(
             frag: tokio::sync::Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             secure: false,
+            rtt_ms: AtomicU64::new(0),
+            last_rx_ms: AtomicU64::new(mono_ms()),
         });
     }
     let location = headers.get("location").cloned().unwrap_or_default();

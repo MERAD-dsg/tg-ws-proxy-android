@@ -132,8 +132,23 @@
     <string name="notification_error">Ошибка: %1$s</string>
     <string name="notification_running">Прокси работает</string>
     <string name="notification_not_responding">⚠ Прокси не отвечает</string>
-    <string name="notification_traffic">Трафик: %1$s · %2$d сесс.</string>
+    <string name="notification_traffic_ping">Трафик: %1$s · %2$d сесс. · пинг %3$d мс</string>
+Трафик: %1$s · %2$d сесс.</string>
     <string name="notification_restarting">Перезапуск прокси...</string>
+    <string name="app_name_short">TG WS Proxy</string>
+    <string name="nav_settings_short">Настройки</string>
+    <string name="nav_logs_short">Журнал</string>
+    <string name="copy_link">Ссылка</string>
+    <string name="no_clients_found">Клиенты не найдены</string>
+    <string name="pick_client">Выберите клиент</string>
+    <string name="open_client_failed">Ошибка при открытии клиента</string>
+    <string name="home_ping">пинг</string>
+    <string name="home_route">маршрут</string>
+    <string name="home_traffic">трафик</string>
+    <string name="route_direct">прямой</string>
+    <string name="route_worker">worker</string>
+    <string name="route_cf">CF</string>
+    <string name="route_tcp">TCP</string>
     <string name="notification_stopping">Остановка прокси...</string>
     <string name="notification_channel_name">Фоновый Прокси</string>
     <string name="notification_channel_description">Уведомление о работе прокси-сервера</string>

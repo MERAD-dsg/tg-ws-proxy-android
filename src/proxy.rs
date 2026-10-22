@@ -830,11 +830,19 @@ where
     let mut conn_read = conn_read;
     let mut conn_write = conn_write;
 
-    // ping keepalive (мобильное улучшение поверх оригинала).
+    // Keepalive + детектор мёртвого соединения.
+    //
+    // Раньше ping уходил раз в 30 с, а факт «сервер не ответил» никто не
+    // проверял: сессия жила до BRIDGE_READ_TIMEOUT (120 с). На мобильной сети
+    // TCP часто «умирает молча» (переключение LTE↔Wi-Fi, NAT-таймаут) —
+    // Telegram в это время висел на «Подключение прокси…», пинг в UI уходил
+    // в тысячи мс. Теперь пингуем каждые 12 с, ждём pong 6 с и при тишине
+    // сразу закрываем сессию, чтобы Telegram переподключился на живой маршрут.
     let ws_ping = ws.clone();
     let la_ping = last_activity.clone();
     let cancel_ping = cancel.clone();
     let cancel_token_ping = cancel_token.clone();
+    let stalled_ping = stalled.clone();
     let ping_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL);
         interval.tick().await;
@@ -844,12 +852,34 @@ where
                 _ = cancel_ping.notified() => return,
                 _ = interval.tick() => {
                     let idle = la_ping.lock().await.elapsed();
-                    if idle > BRIDGE_PING_INTERVAL {
-                        if ws_ping.send_ping().await.is_err() {
+                    if idle < BRIDGE_PING_INTERVAL {
+                        continue;
+                    }
+                    let sent_at = match ws_ping.send_ping_ts().await {
+                        Ok(ts) => ts,
+                        Err(_) => {
                             cancel_ping.notify_waiters();
                             return;
                         }
+                    };
+                    // Ждём pong (или любой входящий фрейм) — признак живого
+                    // маршрута в обе стороны.
+                    tokio::time::sleep(BRIDGE_PONG_TIMEOUT).await;
+                    if ws_ping.is_closed() {
+                        return;
                     }
+                    if ws_ping.last_rx_ms() >= sent_at {
+                        continue;
+                    }
+                    stalled_ping.store(true, Ordering::Relaxed);
+                    STATS.dead_sessions.fetch_add(1, Ordering::Relaxed);
+                    lwarn!(
+                        " WS session: нет pong за {}с — соединение мертво, закрываю (Telegram переподключится)",
+                        BRIDGE_PONG_TIMEOUT.as_secs()
+                    );
+                    ws_ping.close().await;
+                    cancel_ping.notify_waiters();
+                    return;
                 }
             }
         }
@@ -878,6 +908,7 @@ where
                     if let Some(t) = sent {
                         if t.elapsed() >= BRIDGE_FIRST_DOWNSTREAM_TIMEOUT {
                             watchdog_stalled.store(true, Ordering::Relaxed);
+                            STATS.dead_sessions.fetch_add(1, Ordering::Relaxed);
                             lwarn!(
                                 " WS session: нет ответа от Telegram {:.0}с после данных клиента — закрываю мёртвый маршрут",
                                 t.elapsed().as_secs_f64()
@@ -1658,11 +1689,14 @@ where
                 if outcome.stalled {
                     // Worker отдал 101, но MTProto через него не пошёл —
                     // уводим этот worker в cooldown, чтобы не залипать.
+                    route_mark_bad(dc, RouteKind::Worker);
                     mark_domain_fail(&used_worker_domain);
                     lwarn!(
                         " DC{}{} worker {} без downstream — в cooldown",
                         dc, m_tag, used_worker_domain
                     );
+                } else if outcome.down_bytes > 0 {
+                    route_mark_good(dc, RouteKind::Worker);
                 }
                 return true;
             }
@@ -1696,11 +1730,14 @@ where
                 )
                 .await;
                 if outcome.stalled {
+                    route_mark_bad(dc, RouteKind::CfPool);
                     mark_domain_fail(&chosen_domain);
                     lwarn!(
                         " DC{}{} CF {} без downstream — домен в cooldown",
                         dc, m_tag, chosen_domain
                     );
+                } else if outcome.down_bytes > 0 {
+                    route_mark_good(dc, RouteKind::CfPool);
                 }
                 return true;
             }
@@ -1748,6 +1785,9 @@ where
 
     // Шаг 3: tcp.
     if !fallback_dst.is_empty() {
+        STATS
+            .last_route
+            .store(RouteKind::Tcp.code(), Ordering::Relaxed);
         linfo!(
             "[{}] DC{}{} -> TCP fallback to {}:{}",
             label, dc, m_tag, fallback_dst, secure_port
@@ -2174,7 +2214,14 @@ async fn serve_core<R, W>(
     // нет общих 429). Если он настроен, идём в fallback сразу, не дожидаясь,
     // пока прямой WS «полуподключится» и зависнет.
     let has_own_worker = !CF_WORKER_DOMAINS.read().is_empty();
-    let prefer_worker = has_own_worker && !is_test_dc;
+    // Липкий маршрут: если прямой WS недавно работал — не тратим RTT на
+    // Cloudflare (он добавляет 40-150 мс к каждому соединению). Если работал
+    // worker — идём через него, как раньше. Нет истории — worker приоритетен.
+    let preferred_route = route_preferred(dc);
+    let prefer_worker = has_own_worker
+        && !is_test_dc
+        && preferred_route != Some(RouteKind::Direct)
+        && !route_recently_bad(dc, RouteKind::Worker);
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || has_own_worker;
 
@@ -2493,10 +2540,15 @@ async fn serve_core<R, W>(
                 .write()
                 .insert(target.clone(), now2 + IP_FAIL_COOLDOWN);
         }
+        route_mark_bad(dc, RouteKind::Direct);
         lwarn!(
             "[{}] DC{}{} прямой WS без downstream -> DC в cooldown",
             label, dc, m_tag
         );
+    } else if outcome.down_bytes > 0 {
+        // Маршрут реально провёз данные — запоминаем его как лучший, чтобы
+        // следующее соединение не тратило время на перебор.
+        route_mark_good(dc, RouteKind::Direct);
     }
 }
 

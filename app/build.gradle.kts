@@ -12,8 +12,8 @@ android {
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
         targetSdk = 35
-        versionCode = 134
-        versionName = "1.3.4"
+        versionCode = 140
+        versionName = "1.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

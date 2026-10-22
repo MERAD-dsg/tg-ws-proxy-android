@@ -158,4 +158,56 @@ object NativeProxy {
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
     }
+
+    /**
+     * Разобранная статистика движка — для главного экрана и уведомления.
+     * Один вызов JNA вместо десятка `substringAfter` в UI-потоке.
+     */
+    fun readStats(): ProxyStats? = getStats()?.let { parseStats(it) }
+
+    fun parseStats(raw: String): ProxyStats {
+        fun num(key: String, def: Int = 0): Int {
+            val idx = raw.indexOf("$key=")
+            if (idx < 0) return def
+            val start = idx + key.length + 1
+            var end = start
+            while (end < raw.length && (raw[end].isDigit() || raw[end] == '-')) end++
+            return raw.substring(start, end).toIntOrNull() ?: def
+        }
+
+        fun size(key: String): String {
+            val idx = raw.indexOf("$key=")
+            if (idx < 0) return "0"
+            val start = idx + key.length + 1
+            var end = start
+            while (end < raw.length && raw[end] != ' ') end++
+            return raw.substring(start, end)
+        }
+
+        return ProxyStats(
+            active = num("active"),
+            pingMs = num("ping"),
+            pingAvgMs = num("ping_avg"),
+            deadSessions = num("dead"),
+            route = num("route"),
+            up = size("up"),
+            down = size("down"),
+            badHandshakes = num("bad"),
+        )
+    }
+}
+
+/** Снимок статистики нативного движка (см. Stats::summary в src/config.rs). */
+data class ProxyStats(
+    val active: Int,
+    val pingMs: Int,
+    val pingAvgMs: Int,
+    val deadSessions: Int,
+    val route: Int,
+    val up: String,
+    val down: String,
+    val badHandshakes: Int,
+) {
+    /** 0 — не измеряли; показываем «—». */
+    val hasPing: Boolean get() = pingAvgMs > 0 || pingMs > 0
 }
