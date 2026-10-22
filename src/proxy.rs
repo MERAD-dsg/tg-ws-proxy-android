@@ -2218,9 +2218,11 @@ async fn serve_core<R, W>(
     // Cloudflare (он добавляет 40-150 мс к каждому соединению). Если работал
     // worker — идём через него, как раньше. Нет истории — worker приоритетен.
     let preferred_route = route_preferred(dc);
+    // История есть — идём проверенным маршрутом. Истории нет — запускаем
+    // гонку прямого WS и worker (ниже), поэтому заранее worker не выбираем.
     let prefer_worker = has_own_worker
         && !is_test_dc
-        && preferred_route != Some(RouteKind::Direct)
+        && preferred_route == Some(RouteKind::Worker)
         && !route_recently_bad(dc, RouteKind::Worker);
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || has_own_worker;
@@ -2310,6 +2312,46 @@ async fn serve_core<R, W>(
             .await;
         if ws_opt.is_some() {
             linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
+        }
+    }
+
+    // Гонка маршрутов: когда истории ещё нет, запускаем прямой WS и свой
+    // worker ОДНОВРЕМЕННО и берём тот, что ответит первым. Это убирает
+    // «слепой» выбор маршрута и до 3-5 с ожидания на первом соединении.
+    if ws_opt.is_none()
+        && has_own_worker
+        && !is_test_dc
+        && preferred_route.is_none()
+        && !route_recently_bad(dc, RouteKind::Worker)
+    {
+        let race_dst = resolve_fallback_target(dc, is_media, is_test_dc);
+        if !race_dst.is_empty() {
+            let worker_list = CF_WORKER_DOMAINS.read().clone();
+            let race_path = format!("/apiws?dst={}&dc={}", race_dst, dc);
+            linfo!(
+                "[{}] DC{}{} -> гонка маршрутов: прямой WS и worker параллельно",
+                label, dc, m_tag
+            );
+            let direct_fut = connect_direct_ws(&target, &domains, ws_timeout, ws_path);
+            let worker_fut = dial_worker_ws(&worker_list, &race_path, ws_timeout.max(3.0));
+            tokio::pin!(direct_fut, worker_fut);
+            tokio::select! {
+                (maybe_ws, _r, _a) = &mut direct_fut => {
+                    if let Some(ws) = maybe_ws {
+                        linfo!("[{}] DC{}{} гонка: победил прямой WS", label, dc, m_tag);
+                        all_redirects = false;
+                        ws_opt = Some(ws);
+                    }
+                }
+                res = &mut worker_fut => {
+                    if let Some((ws, dom)) = res {
+                        linfo!("[{}] DC{}{} гонка: победил worker {}", label, dc, m_tag, dom);
+                        route_mark_good(dc, RouteKind::Worker);
+                        all_redirects = false;
+                        ws_opt = Some(ws);
+                    }
+                }
+            }
         }
     }
 
@@ -2550,6 +2592,37 @@ async fn serve_core<R, W>(
         // следующее соединение не тратило время на перебор.
         route_mark_good(dc, RouteKind::Direct);
     }
+}
+
+/// Быстрый диалап своего Cloudflare Worker без пула и без bridge.
+///
+/// Нужен для «гонки маршрутов»: на нестабильной сети невозможно заранее
+/// сказать, что поднимется быстрее — прямой WS (часто режется DPI) или
+/// worker (иногда лежит сам workers.dev). Раньше маршрут выбирался
+/// последовательно, и неудачная попытка стоила 3-5 секунд «Подключения…».
+async fn dial_worker_ws(
+    worker_domains: &[String],
+    path: &str,
+    timeout: f64,
+) -> Option<(RawWebSocket, String)> {
+    for worker_domain in worker_domains.iter().take(2) {
+        for secure in [true, false] {
+            match ws_connect_full_opts(
+                worker_domain,
+                worker_domain,
+                path,
+                timeout,
+                None,
+                Some(secure),
+            )
+            .await
+            {
+                Ok(ws) => return Some((ws, worker_domain.clone())),
+                Err(_) => continue,
+            }
+        }
+    }
+    None
 }
 
 // connectDirectWS — прямой перебор доменов (тихий, для retry-пути).
