@@ -133,7 +133,7 @@
     <string name="notification_running">Proxy is running</string>
     <string name="notification_not_responding">⚠ Proxy is not responding</string>
     <string name="notification_traffic_ping">Traffic: %1$s · %2$d sess. · ping %3$d ms</string>
-Traffic: %1$s · %2$d sess.</string>
+    <string name="notification_traffic">Traffic: %1$s · %2$d sess.</string>
     <string name="notification_restarting">Restarting proxy...</string>
     <string name="app_name_short">TG WS Proxy</string>
     <string name="nav_settings_short">Settings</string>

@@ -133,7 +133,7 @@
     <string name="notification_running">Прокси работает</string>
     <string name="notification_not_responding">⚠ Прокси не отвечает</string>
     <string name="notification_traffic_ping">Трафик: %1$s · %2$d сесс. · пинг %3$d мс</string>
-Трафик: %1$s · %2$d сесс.</string>
+    <string name="notification_traffic">Трафик: %1$s · %2$d сесс.</string>
     <string name="notification_restarting">Перезапуск прокси...</string>
     <string name="app_name_short">TG WS Proxy</string>
     <string name="nav_settings_short">Настройки</string>
