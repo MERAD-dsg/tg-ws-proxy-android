@@ -22,6 +22,27 @@ class SettingsStore(private val context: Context) {
         private const val LEGACY_DIRECT_DC_IP = "149.154.167.220"
         const val DEFAULT_LOG_SHOW_INFO = true
         const val DEFAULT_LOG_SHOW_ERROR = false
+
+        /**
+         * Приводит секрет к каноническому виду: 32 hex-символа в нижнем регистре.
+         * Принимает значение как есть, а также полный секрет из ссылки Telegram
+         * (`dd<hex>` или `ee<hex><domain>`) и лишние пробелы.
+         * null — значение не является корректным секретом.
+         */
+        fun normalizeSecret(raw: String): String? {
+            val s = raw.trim().lowercase()
+            if (s.isEmpty()) return null
+            val body = if (s.length > 32 && (s.startsWith("dd") || s.startsWith("ee"))) s.substring(2) else s
+            if (body.length < 32) return null
+            val secret = body.substring(0, 32)
+            return if (secret.all { it in "0123456789abcdef" }) secret else null
+        }
+
+        fun generateRandomSecret(): String {
+            val bytes = ByteArray(16)
+            java.security.SecureRandom().nextBytes(bytes)
+            return bytes.joinToString("") { "%02x".format(it) }
+        }
     }
 
     private object Keys {
@@ -39,8 +60,13 @@ class SettingsStore(private val context: Context) {
         val CFPROXY_ENABLED = booleanPreferencesKey("cfproxy_enabled")
         val CUSTOM_CF_DOMAIN_ENABLED = booleanPreferencesKey("custom_cf_domain_enabled")
         val CUSTOM_CF_DOMAIN = stringPreferencesKey("custom_cf_domain")
+        val CFPROXY_EXTRA_URLS = stringPreferencesKey("cfproxy_extra_urls")
+        val CF_WORKER_DOMAINS = stringPreferencesKey("cf_worker_domains")
+        val DPI_BYPASS_ENABLED = booleanPreferencesKey("dpi_bypass_enabled")
+        val UPSTREAM_PROXY_URL = stringPreferencesKey("upstream_proxy_url")
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
         val SECRET_KEY = stringPreferencesKey("secret_key")
+        val SECRET_HISTORY = stringPreferencesKey("secret_history")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
         val LOG_SHOW_ERROR = booleanPreferencesKey("log_show_error")
@@ -85,8 +111,20 @@ class SettingsStore(private val context: Context) {
     val cfproxyEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CFPROXY_ENABLED] ?: true }
     val customCfDomainEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN_ENABLED] ?: false }
     val customCfDomain: Flow<String> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN] ?: "" }
+    val cfproxyExtraUrls: Flow<String> = context.dataStore.data.map { it[Keys.CFPROXY_EXTRA_URLS] ?: "" }
+    /** Свои Cloudflare Worker-домены (свой бесплатный worker вместо общего пула). */
+    val cfWorkerDomains: Flow<String> = context.dataStore.data.map { it[Keys.CF_WORKER_DOMAINS] ?: "" }
+    val dpiBypassEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.DPI_BYPASS_ENABLED] ?: true }
+    val upstreamProxyUrl: Flow<String> = context.dataStore.data.map { it[Keys.UPSTREAM_PROXY_URL] ?: "" }
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
+
+    /**
+     * Недавние секреты: прокси принимает их наравне с активным, чтобы после
+     * смены секрета старая ссылка в Telegram продолжала работать
+     * (иначе — «bad handshake» и шторм переподключений).
+     */
+    val secretHistory: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_HISTORY] ?: "" }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
     val logShowInfo: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_INFO] ?: DEFAULT_LOG_SHOW_INFO }
@@ -107,7 +145,51 @@ class SettingsStore(private val context: Context) {
     val updateDialogLastActionAt: Flow<Long> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
 
     suspend fun saveSecretKey(key: String) {
-        context.dataStore.edit { it[Keys.SECRET_KEY] = key }
+        val normalized = normalizeSecret(key) ?: return
+        context.dataStore.edit { prefs ->
+            val prev = normalizeSecret(prefs[Keys.SECRET_KEY].orEmpty())
+            if (prev != null && prev != normalized) {
+                prefs[Keys.SECRET_HISTORY] = pushHistory(prefs[Keys.SECRET_HISTORY].orEmpty(), prev)
+            }
+            prefs[Keys.SECRET_KEY] = normalized
+        }
+    }
+
+    private fun pushHistory(existing: String, secret: String): String {
+        val items = existing.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+        items.remove(secret)
+        items.add(0, secret)
+        return items.take(3).joinToString(",")
+    }
+
+    /**
+     * Атомарно возвращает сохранённый секрет, а если его нет/он битый —
+     * генерирует и сохраняет новый.
+     *
+     * Важно: раньше генерация была в двух местах (главный экран и запуск
+     * прокси), и при гонке в Telegram попадал один секрет, а прокси
+     * запускался с другим — Telegram получал «bad handshake».
+     */
+    suspend fun getOrCreateSecret(): String {
+        var result = ""
+        context.dataStore.edit { prefs ->
+            val existing = normalizeSecret(prefs[Keys.SECRET_KEY].orEmpty())
+            result = if (existing != null) {
+                if (prefs[Keys.SECRET_KEY] != existing) prefs[Keys.SECRET_KEY] = existing
+                existing
+            } else {
+                val generated = generateRandomSecret()
+                // Старый (битый/другой) секрет — в историю, а не в мусор:
+                // Telegram мог сохранить ссылку именно с ним.
+                val prev = prefs[Keys.SECRET_KEY].orEmpty()
+                if (normalizeSecret(prev) != null) {
+                    prefs[Keys.SECRET_HISTORY] = pushHistory(prefs[Keys.SECRET_HISTORY].orEmpty(), prev)
+                }
+                prefs[Keys.SECRET_KEY] = generated
+                generated
+            }
+        }
+        return result
     }
 
     suspend fun saveThemeMode(mode: String) {
@@ -191,7 +273,9 @@ class SettingsStore(private val context: Context) {
     suspend fun saveAll(isDcAuto: Boolean, dc1: String, dc2: String, dc3: String, dc4: String, dc5: String, dc203: String,
                         dc1m: String, dc2m: String, dc3m: String, dc4m: String, dc5m: String, dc203m: String,
                         isExperimental: Boolean, bindIp: String, port: String, poolSize: Int,
-                        cfproxyEnabled: Boolean, customCfDomainEnabled: Boolean, customCfDomain: String, secretKey: String) {
+                        cfproxyEnabled: Boolean, customCfDomainEnabled: Boolean, customCfDomain: String,
+                        cfproxyExtraUrls: String, dpiBypassEnabled: Boolean, upstreamProxyUrl: String,
+                        secretKey: String, cfWorkerDomains: String = "") {
         context.dataStore.edit {
             it[Keys.IS_DC_AUTO] = isDcAuto
             it[Keys.DC1] = dc1
@@ -213,7 +297,21 @@ class SettingsStore(private val context: Context) {
             it[Keys.CFPROXY_ENABLED] = cfproxyEnabled
             it[Keys.CUSTOM_CF_DOMAIN_ENABLED] = customCfDomainEnabled
             it[Keys.CUSTOM_CF_DOMAIN] = customCfDomain
-            it[Keys.SECRET_KEY] = secretKey
+            it[Keys.CFPROXY_EXTRA_URLS] = cfproxyExtraUrls
+            it[Keys.CF_WORKER_DOMAINS] = cfWorkerDomains
+            it[Keys.DPI_BYPASS_ENABLED] = dpiBypassEnabled
+            it[Keys.UPSTREAM_PROXY_URL] = upstreamProxyUrl
+            // Пустое/битое значение из UI не должно затирать рабочий секрет:
+            // иначе прокси перезапустится с новым секретом, а в Telegram
+            // останется старая ссылка («bad handshake»).
+            val normalizedSecret = normalizeSecret(secretKey)
+            if (normalizedSecret != null) {
+                val prev = normalizeSecret(it[Keys.SECRET_KEY].orEmpty())
+                if (prev != null && prev != normalizedSecret) {
+                    it[Keys.SECRET_HISTORY] = pushHistory(it[Keys.SECRET_HISTORY].orEmpty(), prev)
+                }
+                it[Keys.SECRET_KEY] = normalizedSecret
+            }
         }
     }
 }

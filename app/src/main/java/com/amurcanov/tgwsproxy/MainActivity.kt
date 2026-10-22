@@ -30,6 +30,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.input.pointer.pointerInput
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Settings
@@ -53,9 +54,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.ui.AppUpdateDialog
-import com.amurcanov.tgwsproxy.ui.ConnectionTab
 import com.amurcanov.tgwsproxy.ui.FloatingToolbar
 import com.amurcanov.tgwsproxy.ui.InfoTab
+import com.amurcanov.tgwsproxy.ui.HomeTab
 import com.amurcanov.tgwsproxy.ui.LogsTab
 import com.amurcanov.tgwsproxy.ui.SettingsTab
 import com.amurcanov.tgwsproxy.ui.TgWsProxyTheme
@@ -160,19 +161,16 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class NavItem(
-    val label: String,
-    val iconRes: androidx.compose.ui.graphics.vector.ImageVector
-)
-
+/**
+ * Минималистичная оболочка: главный экран + три служебных, без нижней
+ * анимированной панели и свайпов (меньше перерисовок и батареи).
+ * Вся отладка сохранена — журнал, настройки с диагностикой маршрутов.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainContent(settingsStore: SettingsStore) {
-    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
-    var dragTargetIndex by remember { mutableIntStateOf(-1) }
-    var dragProgress by remember { mutableFloatStateOf(0f) }
+    var screen by rememberSaveable { mutableIntStateOf(0) }
     val context = LocalContext.current
-    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val updatePostponeUntil by settingsStore.updatePostponeUntil.collectAsStateWithLifecycle(initialValue = 0L)
     val updatePostponeVersion by settingsStore.updatePostponeVersion.collectAsStateWithLifecycle(initialValue = "")
@@ -184,14 +182,6 @@ fun MainContent(settingsStore: SettingsStore) {
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val currentUpdatePostponeUntil by rememberUpdatedState(updatePostponeUntil)
     val currentUpdatePostponeVersion by rememberUpdatedState(updatePostponeVersion)
-    val navItems = listOf(
-        NavItem(stringResource(R.string.nav_proxy), Icons.Default.PowerSettingsNew),
-        NavItem(stringResource(R.string.settings), Icons.Default.Settings),
-        NavItem(stringResource(R.string.nav_logs), Icons.Default.Terminal),
-        NavItem(stringResource(R.string.info), Icons.Default.Info)
-    )
-    val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
-    val navOverlayReserve = safeBottomInset + 96.dp
 
     DisposableEffect(Unit) {
         LogManager.startListening()
@@ -208,11 +198,8 @@ fun MainContent(settingsStore: SettingsStore) {
         if (updateLastCheckAt > 0L) {
             val nextCheckAt = updateLastCheckAt + intervalMillis
             val now = System.currentTimeMillis()
-            if (nextCheckAt > now) {
-                delay(nextCheckAt - now)
-            }
+            if (nextCheckAt > now) delay(nextCheckAt - now)
         }
-
         if (!isActive) return@LaunchedEffect
 
         val checkedAt = System.currentTimeMillis()
@@ -222,18 +209,12 @@ fun MainContent(settingsStore: SettingsStore) {
             latestVersion = release?.versionTag ?: "",
             error = if (release == null) context.getString(R.string.update_check_failed_short) else ""
         )
-
         if (release == null) {
             Log.w("TgWsProxy", "[WARN] Update check: no release info, local=$currentVersion")
         } else {
             val hasUpdate = isNewerVersion(currentVersion, release.versionTag)
             val isPostponed =
                 currentUpdatePostponeVersion == release.versionTag && checkedAt < currentUpdatePostponeUntil
-            Log.i(
-                "TgWsProxy",
-                "Update check: local=$currentVersion remote=${release.versionTag} newer=$hasUpdate postponed=$isPostponed"
-            )
-
             if (hasUpdate && !isPostponed) {
                 settingsStore.saveUpdateDialogShown(release.versionTag, checkedAt)
                 pendingRelease = release
@@ -242,83 +223,34 @@ fun MainContent(settingsStore: SettingsStore) {
     }
 
     Scaffold(
+        topBar = {
+            MinimalTopBar(
+                screen = screen,
+                onHome = { screen = 0 },
+                onSettings = { screen = 1 },
+                onLogs = { screen = 2 },
+                onInfo = { screen = 3 },
+            )
+        },
         contentWindowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top),
         containerColor = Color.Transparent,
     ) { padding ->
-        Box(modifier = Modifier
-            .fillMaxSize()
-            .padding(padding)
-            .consumeWindowInsets(padding)
-            .pointerInput(selectedTab) {
-                var totalDrag = 0f
-                detectHorizontalDragGestures(
-                    onDragStart = {
-                        totalDrag = 0f
-                        dragTargetIndex = -1
-                        dragProgress = 0f
-                    },
-                    onDragCancel = {
-                        dragTargetIndex = -1
-                        dragProgress = 0f
-                    },
-                    onDragEnd = {
-                        if (dragTargetIndex in navItems.indices && dragProgress >= 0.5f) {
-                            selectedTab = dragTargetIndex
-                        }
-                        dragTargetIndex = -1
-                        dragProgress = 0f
-                    }
-                ) { change, dragAmount ->
-                    change.consume()
-                    totalDrag += dragAmount
-                    if (abs(totalDrag) < 12f) {
-                        dragTargetIndex = -1
-                        dragProgress = 0f
-                        return@detectHorizontalDragGestures
-                    }
-
-                    val candidate = if (totalDrag < 0f) selectedTab + 1 else selectedTab - 1
-                    if (candidate !in navItems.indices) {
-                        dragTargetIndex = -1
-                        dragProgress = 0f
-                        return@detectHorizontalDragGestures
-                    }
-
-                    dragTargetIndex = candidate
-                    dragProgress = (abs(totalDrag) / 180f).coerceIn(0f, 1f)
-                }
-            }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .consumeWindowInsets(padding)
         ) {
-            AnimatedContent(
-                targetState = selectedTab,
-                transitionSpec = {
-                    fadeIn(tween(300)) togetherWith fadeOut(tween(225))
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(bottom = navOverlayReserve),
-                label = "tab_content"
-            ) { page ->
-                when (page) {
-                    0 -> ConnectionTab(settingsStore)
-                    1 -> SettingsTab(settingsStore)
-                    2 -> LogsTab(settingsStore)
-                    3 -> InfoTab(settingsStore)
-                }
+            when (screen) {
+                1 -> SettingsTab(settingsStore)
+                2 -> LogsTab(settingsStore)
+                3 -> InfoTab(settingsStore)
+                else -> HomeTab(
+                    settingsStore = settingsStore,
+                    onOpenSettings = { screen = 1 },
+                    onOpenLogs = { screen = 2 },
+                )
             }
-
-            ProxyNavigationBar(
-                navItems = navItems,
-                selectedTab = selectedTab,
-                dragTargetIndex = dragTargetIndex,
-                dragProgress = dragProgress,
-                onTabSelected = { index ->
-                    selectedTab = index
-                    dragTargetIndex = -1
-                    dragProgress = 0f
-                },
-                modifier = Modifier.align(Alignment.BottomCenter)
-            )
         }
     }
 
@@ -356,128 +288,66 @@ fun MainContent(settingsStore: SettingsStore) {
     }
 }
 
+/** Верхняя панель: заголовок + иконки. Никаких анимаций и свайпов. */
 @Composable
-private fun ProxyNavigationBar(
-    navItems: List<NavItem>,
-    selectedTab: Int,
-    dragTargetIndex: Int,
-    dragProgress: Float,
-    onTabSelected: (Int) -> Unit,
-    modifier: Modifier = Modifier
+private fun MinimalTopBar(
+    screen: Int,
+    onHome: () -> Unit,
+    onSettings: () -> Unit,
+    onLogs: () -> Unit,
+    onInfo: () -> Unit,
 ) {
-    val colors = MaterialTheme.colorScheme
-    val isDark = colors.background.luminance() < 0.22f
-    val selectedColor = colors.primary
-    val unselectedColor = colors.onSurfaceVariant.copy(alpha = 0.55f)
-    val shellColor = if (isDark) {
-        colors.surface.copy(alpha = 0.78f)
-    } else {
-        lerp(colors.surface, colors.surfaceVariant, 0.48f).copy(alpha = 0.95f)
-    }
-    val shellBorder = if (isDark) {
-        colors.outlineVariant.copy(alpha = 0.42f)
-    } else {
-        colors.outline.copy(alpha = 0.16f)
-    }
-    val indicatorColor = if (isDark) {
-        colors.primaryContainer.copy(alpha = 0.84f)
-    } else {
-        lerp(colors.primaryContainer, colors.surface, 0.18f).copy(alpha = 0.97f)
-    }
-    val indicatorIndex = remember { Animatable(selectedTab.toFloat()) }
-    val dragVisualIndex = indicatorIndex.value
-
-    LaunchedEffect(selectedTab) {
-        if (dragTargetIndex !in navItems.indices) {
-            indicatorIndex.animateTo(
-                targetValue = selectedTab.toFloat(),
-                animationSpec = tween(
-                    durationMillis = 720,
-                    easing = CubicBezierEasing(0.2f, 0.9f, 0.24f, 1f)
-                )
-            )
-        }
-    }
-
-    LaunchedEffect(selectedTab, dragTargetIndex, dragProgress) {
-        if (dragTargetIndex in navItems.indices) {
-            val target = selectedTab.toFloat() + (dragTargetIndex - selectedTab) * dragProgress
-            indicatorIndex.snapTo(target)
-        }
-    }
-
-    BoxWithConstraints(
-        modifier = modifier
+    val titles = listOf(
+        stringResource(R.string.app_name_short),
+        stringResource(R.string.settings),
+        stringResource(R.string.nav_logs),
+        stringResource(R.string.info),
+    )
+    Row(
+        modifier = Modifier
             .fillMaxWidth()
-            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))
-            .padding(horizontal = 22.dp, vertical = 12.dp)
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
+            .height(56.dp)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        val trackPadding = 8.dp
-        val itemWidth = (maxWidth - trackPadding * 2) / navItems.size
-        val indicatorOffset = trackPadding + itemWidth * dragVisualIndex
-
-        Surface(
-            shape = RoundedCornerShape(28.dp),
-            color = shellColor,
-            border = BorderStroke(1.dp, shellBorder),
-            tonalElevation = 0.dp,
-            shadowElevation = if (isDark) 10.dp else 8.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(72.dp)
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(22.dp),
-                    color = indicatorColor,
-                    modifier = Modifier
-                        .offset(x = indicatorOffset)
-                        .padding(vertical = 6.dp)
-                        .width(itemWidth)
-                        .fillMaxHeight()
-                ) {}
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = trackPadding, vertical = 6.dp)
-                ) {
-                    navItems.forEachIndexed { index, item ->
-                        val emphasis = (1f - abs(index - dragVisualIndex)).coerceIn(0f, 1f)
-                        val iconColor = lerp(unselectedColor, selectedColor, emphasis)
-
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxHeight()
-                                .clip(RoundedCornerShape(22.dp))
-                                .clickable { onTabSelected(index) },
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                imageVector = item.iconRes,
-                                contentDescription = item.label,
-                                modifier = Modifier.size(22.dp),
-                                tint = iconColor
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = item.label,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = if (emphasis > 0.55f) FontWeight.SemiBold else FontWeight.Medium,
-                                color = iconColor,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
+        if (screen != 0) {
+            IconButton(onClick = onHome) {
+                Icon(
+                    Icons.Default.ArrowBack,
+                    contentDescription = stringResource(R.string.nav_proxy),
+                    tint = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+        Text(
+            text = titles.getOrElse(screen) { titles[0] },
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = if (screen == 0) 8.dp else 0.dp),
+        )
+        if (screen != 1) {
+            IconButton(onClick = onSettings) {
+                Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.settings))
+            }
+        }
+        if (screen != 2) {
+            IconButton(onClick = onLogs) {
+                Icon(Icons.Default.Terminal, contentDescription = stringResource(R.string.nav_logs))
+            }
+        }
+        if (screen != 3) {
+            IconButton(onClick = onInfo) {
+                Icon(Icons.Default.Info, contentDescription = stringResource(R.string.info))
             }
         }
     }
 }
+
 
 private fun android16OrbShape(points: Int, innerRatio: Float): Shape = GenericShape { size, _ ->
     val centerX = size.width / 2f

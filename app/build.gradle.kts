@@ -12,8 +12,8 @@ android {
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
         targetSdk = 35
-        versionCode = 123
-        versionName = "1.2.3"
+        versionCode = 140
+        versionName = "1.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -102,6 +102,7 @@ android {
             } else {
                 println("⚠️ WARNING: Keystore not found, using debug signing")
                 println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
+                signingConfig = signingConfigs.getByName("debug")
             }
         }
     }

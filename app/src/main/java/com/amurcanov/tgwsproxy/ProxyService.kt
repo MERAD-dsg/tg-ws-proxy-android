@@ -41,7 +41,12 @@ class ProxyService : Service() {
     private var lastCfEnabled: Boolean = true
     private var lastCfPriority: Boolean = true
     private var lastCfDomain: String = ""
+    private var lastCfExtraUrls: String = ""
+    private var lastCfWorkerDomains: String = ""
+    private var lastDpiBypass: Boolean = true
+    private var lastUpstreamProxy: String = ""
     private var lastSecretKey: String = ""
+    private var lastSecretHistory: String = ""
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -54,7 +59,12 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_ENABLED = "EXTRA_CFPROXY_ENABLED"
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
+        const val EXTRA_CFPROXY_EXTRA_URLS = "EXTRA_CFPROXY_EXTRA_URLS"
+        const val EXTRA_CF_WORKER_DOMAINS = "EXTRA_CF_WORKER_DOMAINS"
+        const val EXTRA_DPI_BYPASS = "EXTRA_DPI_BYPASS"
+        const val EXTRA_UPSTREAM_PROXY = "EXTRA_UPSTREAM_PROXY"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
+        const val EXTRA_SECRET_HISTORY = "EXTRA_SECRET_HISTORY"
         
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -91,8 +101,14 @@ class ProxyService : Service() {
                 val cfEnabled = intent.getBooleanExtra(EXTRA_CFPROXY_ENABLED, true)
                 val cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true)
                 val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
+                val cfExtraUrls = intent.getStringExtra(EXTRA_CFPROXY_EXTRA_URLS) ?: ""
+                val cfWorkerDomains = intent.getStringExtra(EXTRA_CF_WORKER_DOMAINS) ?: ""
+                val dpiBypass = intent.getBooleanExtra(EXTRA_DPI_BYPASS, true)
+                val upstreamProxy = intent.getStringExtra(EXTRA_UPSTREAM_PROXY) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey)
+                val secretHistory = intent.getStringExtra(EXTRA_SECRET_HISTORY) ?: ""
+                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain,
+                    cfExtraUrls, dpiBypass, upstreamProxy, secretKey, cfWorkerDomains, secretHistory)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -105,7 +121,9 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey)
+                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain,
+                        lastCfExtraUrls, lastDpiBypass, lastUpstreamProxy, lastSecretKey, lastCfWorkerDomains,
+                        lastSecretHistory)
                 } else {
                     stopSelf()
                 }
@@ -132,7 +150,10 @@ class ProxyService : Service() {
 
     private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
-                           cfDomain: String = "", secretKey: String = "") {
+                           cfDomain: String = "", cfExtraUrls: String = "",
+                           dpiBypass: Boolean = true, upstreamProxy: String = "",
+                           secretKey: String = "", cfWorkerDomains: String = "",
+                           secretHistory: String = "") {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -144,7 +165,12 @@ class ProxyService : Service() {
         lastCfEnabled = cfEnabled
         lastCfPriority = cfPriority
         lastCfDomain = cfDomain
+        lastCfExtraUrls = cfExtraUrls
+        lastCfWorkerDomains = cfWorkerDomains
+        lastDpiBypass = dpiBypass
+        lastUpstreamProxy = upstreamProxy
         lastSecretKey = secretKey
+        lastSecretHistory = secretHistory
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
@@ -180,8 +206,16 @@ class ProxyService : Service() {
                 NativeProxy.setPoolSize(poolSize)
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
+                NativeProxy.setCfProxyExtraUrls(cfExtraUrls)
+                NativeProxy.setCfWorkerDomains(cfWorkerDomains.trim())
+                NativeProxy.setUpstreamProxy(upstreamProxy.trim())
+                NativeProxy.setDpiBypass(dpiBypass)
+                NativeProxy.setSecretHistory(secretHistory.trim())
                 val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
                 if (result == 0) {
+                    // Самоисцеление секрета: ссылка в Telegram должна совпадать
+                    // с тем секретом, с которым реально работает нативный прокси.
+                    syncActiveSecret(secretKey)
                     serviceScope.launch {
                         if (!stopInProgress) {
                             updateRunningState(true)
@@ -189,6 +223,13 @@ class ProxyService : Service() {
                             updateNotification(getString(R.string.notification_running), force = true)
                             Log.i(TAG, "Proxy ready: listening on port $port")
                         }
+                    }
+                } else if (result == -4) {
+                    Log.e(TAG, "StartProxy rejected the MTProto secret")
+                    serviceScope.launch {
+                        updateNotification(getString(R.string.notification_bad_secret), force = true)
+                        delay(5000.milliseconds)
+                        stopProxy()
                     }
                 } else {
                     Log.e(TAG, "StartProxy returned error code: $result")
@@ -227,20 +268,47 @@ class ProxyService : Service() {
                 delay(STATS_UPDATE_MS.milliseconds)
                 if (_isRunning.value && !stopInProgress) {
                     try {
-                        val rawStats = NativeProxy.getStats() ?: continue
-                        val upRaw = extractStat(rawStats, "up=")
-                        val downRaw = extractStat(rawStats, "down=")
-                        val activeConns = extractStat(rawStats, "active=")
-                        
-                        val totalBytes = parseHumanBytes(upRaw) + parseHumanBytes(downRaw)
-                        val active = activeConns.toIntOrNull() ?: 0
-                        val text = getString(R.string.notification_traffic, formatBytes(totalBytes), active)
+                        val stats = NativeProxy.parseStats(NativeProxy.getStats() ?: continue)
+                        val totalBytes = parseHumanBytes(stats.up) + parseHumanBytes(stats.down)
+                        // В уведомлении — только ping и число соединений:
+                        // строка обновляется раз в пару секунд и не должна прыгать.
+                        val text = getString(
+                            R.string.notification_traffic_ping,
+                            formatBytes(totalBytes),
+                            stats.active,
+                            if (stats.hasPing) stats.pingAvgMs else 0
+                        )
                         updateNotification(text)
                     } catch (e: Exception) {
                         Log.w(TAG, "Stats update failed", e)
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Если пользователь успел сменить секрет, а прокси уже был запущен —
+     * нативный секрет отличается от сохранённого. Приводим хранилище к
+     * фактическому секрету, чтобы ссылка «Применить в Telegram» не расходилась
+     * с прокси (иначе Telegram бесконечно присылает «bad handshake»).
+     */
+    private fun syncActiveSecret(requested: String) {
+        try {
+            val active = NativeProxy.getActiveSecret() ?: return
+            val normalizedActive = SettingsStore.normalizeSecret(active) ?: return
+            val requestedNormalized = SettingsStore.normalizeSecret(requested)
+            if (requestedNormalized != normalizedActive) {
+                Log.w(
+                    TAG,
+                    "Active proxy secret differs from requested; syncing settings to the active one"
+                )
+                CoroutineScope(Dispatchers.IO).launch {
+                    SettingsStore(applicationContext).saveSecretKey(normalizedActive)
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "syncActiveSecret failed", e)
         }
     }
 
@@ -288,19 +356,16 @@ class ProxyService : Service() {
                 cfEnabled = lastCfEnabled,
                 cfPriority = lastCfPriority,
                 cfDomain = lastCfDomain,
-                secretKey = lastSecretKey
+                cfExtraUrls = lastCfExtraUrls,
+                dpiBypass = lastDpiBypass,
+                upstreamProxy = lastUpstreamProxy,
+                secretKey = lastSecretKey,
+                cfWorkerDomains = lastCfWorkerDomains,
+                secretHistory = lastSecretHistory
             )
         }
     }
 
-    private fun extractStat(stats: String, key: String): String {
-        val idx = stats.indexOf(key)
-        if (idx == -1) return "0B"
-        val start = idx + key.length
-        val end = stats.indexOf(" ", start)
-        return if (end == -1) stats.substring(start) else stats.substring(start, end)
-    }
-    
     private fun parseHumanBytes(s: String): Double {
         val num = s.replace(Regex("[^0-9.]"), "").toDoubleOrNull() ?: 0.0
         return when {

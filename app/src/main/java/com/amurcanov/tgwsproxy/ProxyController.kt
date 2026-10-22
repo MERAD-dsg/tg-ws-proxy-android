@@ -31,7 +31,12 @@ object ProxyController {
         val cfEnabled = settingsStore.cfproxyEnabled.first()
         val customCfDomainEnabled = settingsStore.customCfDomainEnabled.first()
         val customCfDomain = settingsStore.customCfDomain.first().trim()
+        val cfExtraUrls = settingsStore.cfproxyExtraUrls.first().trim()
+        val cfWorkerDomains = settingsStore.cfWorkerDomains.first().trim()
+        val dpiBypassEnabled = settingsStore.dpiBypassEnabled.first()
+        val upstreamProxyUrl = settingsStore.upstreamProxyUrl.first().trim()
         val secretKey = ensureSecretKey(settingsStore)
+        val secretHistory = settingsStore.secretHistory.first().trim()
 
         val parsedIps = buildList {
             if (!isDcAuto) {
@@ -67,7 +72,15 @@ object ProxyController {
                     ProxyService.EXTRA_CFPROXY_DOMAIN,
                     if (customCfDomainEnabled && cfEnabled) customCfDomain else ""
                 )
+                putExtra(ProxyService.EXTRA_CFPROXY_EXTRA_URLS, if (cfEnabled) cfExtraUrls else "")
+                putExtra(
+                    ProxyService.EXTRA_CF_WORKER_DOMAINS,
+                    if (cfEnabled) cfWorkerDomains else ""
+                )
+                putExtra(ProxyService.EXTRA_DPI_BYPASS, dpiBypassEnabled)
+                putExtra(ProxyService.EXTRA_UPSTREAM_PROXY, upstreamProxyUrl)
                 putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
+                putExtra(ProxyService.EXTRA_SECRET_HISTORY, secretHistory)
             }
         )
         ProxyTileService.requestSync(context)
@@ -84,14 +97,9 @@ object ProxyController {
     }
 
     private suspend fun ensureSecretKey(settingsStore: SettingsStore): String {
-        val current = settingsStore.secretKey.first().trim()
-        if (isValidSecret(current)) {
-            return current
-        }
-
-        val generated = generateRandomSecret()
-        settingsStore.saveSecretKey(generated)
-        return generated
+        // Атомарно: либо существующий корректный секрет, либо новый — ровно
+        // тот, который сохранится, и который увидит пользователь.
+        return settingsStore.getOrCreateSecret()
     }
 
     private fun MutableList<String>.appendDc(dc: Int, value: String) {
@@ -101,13 +109,4 @@ object ProxyController {
         }
     }
 
-    private fun generateRandomSecret(): String {
-        val bytes = ByteArray(16)
-        java.security.SecureRandom().nextBytes(bytes)
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun isValidSecret(value: String): Boolean {
-        return value.length == 32 && value.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
-    }
 }

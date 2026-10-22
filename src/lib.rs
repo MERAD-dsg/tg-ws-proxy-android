@@ -2,6 +2,7 @@ pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
+pub mod net;
 pub mod proxy;
 pub mod ws;
 pub mod balancer;
@@ -15,6 +16,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
@@ -82,11 +84,20 @@ pub unsafe extern "C" fn StartProxy(
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
 
-    if secret_str.len() == 32 {
-        if hex::decode(&secret_str).is_ok() {
-            *PROXY_SECRET.write() = secret_str.clone();
+    // Секрет обязателен: без него прокси поднимался с дефолтным `0000…`,
+    // Telegram не мог пройти рукопожатие и в логах шёл бесконечный
+    // «bad handshake (wrong secret or proto)». Теперь это явная ошибка.
+    let secret_str = match sanitize_secret(&secret_str) {
+        Some(s) => s,
+        None => {
+            lerror!(
+                "StartProxy: некорректный MTProto-секрет (нужно 32 hex-символа, получено {} симв.)",
+                secret_str.trim().chars().count()
+            );
+            return -4;
         }
-    }
+    };
+    *PROXY_SECRET.write() = secret_str.clone();
 
     cfproxy::init_cfproxy_domains();
 
@@ -105,6 +116,10 @@ pub unsafe extern "C" fn StartProxy(
     let cancel_root = cancel_tasks.clone();
 
     let handle = rt.spawn(async move {
+        // Фоновое обновление пула доменов (GitHub + зеркала + пользовательские
+        // URL). Раньше оно не запускалось вовсе — пул устаревал и «умирал».
+        cfproxy::start_cfproxy_refresh();
+
         // Предварительный bind для сигнала готовности
         let addr = format!("{}:{}", host_task, go_port);
         match tokio::net::TcpListener::bind(&addr).await {
@@ -227,17 +242,127 @@ pub unsafe extern "C" fn SetCfProxyConfig(
 ) {
     CFPROXY_ENABLED.store(enabled != 0, Ordering::Relaxed);
     let user_domain = cstr_to_string(c_user_domain);
-    // Поддержка нескольких доменов как --cfproxy-domain (repeatable).
+    // Пользовательские домены используются КАК ЕСТЬ (my-proxy.example.org и т.п.),
+    // без decode .com -> .co.uk и без требования суффикса .co.uk.
     let list = coerce_domain_list_str(&user_domain);
+    let user_domains = crate::cfproxy::merge_user_domains(&[list]);
     let mut cfg = CFPROXY.write();
     cfg.user_domain = user_domain.trim().to_string();
-    if !list.is_empty() {
-        cfg.domains = list.clone();
-        cfg.active = list[0].clone();
+    cfg.user_domains = user_domains.clone();
+    if !user_domains.is_empty() {
+        // Приоритет пользователя: его домены идут первыми, авто-пул — запасной.
+        let mut domains = user_domains.clone();
+        for d in cfg.domains.iter() {
+            if !domains.contains(d) {
+                domains.push(d.clone());
+            }
+        }
+        cfg.domains = domains.clone();
+        cfg.active = user_domains[0].clone();
         crate::balancer::BALANCER
             .write()
-            .update_domains_list(&cfg.domains);
+            .update_domains_list_with_priority(user_domains.len(), &domains);
+        linfo!(
+            " CF: пользовательские домены заданы ({}): {:?}",
+            user_domains.len(),
+            user_domains
+        );
     }
+}
+
+/// # Safety
+/// `c_urls` — валидная C-строка или null: URL списков доменов через , ; пробел.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetCfProxyExtraUrls(c_urls: *const c_char) {
+    let raw = cstr_to_string(c_urls);
+    let urls: Vec<String> = raw
+        .replace(',', " ")
+        .replace(';', " ")
+        .split_whitespace()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        .collect();
+    *CFPROXY_EXTRA_URLS.write() = urls;
+}
+
+/// # Safety
+/// `c_url` — валидная C-строка или null: `socks5://user:pass@host:port`
+/// или `http://host:port`. Пусто — прямые соединения.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetUpstreamProxy(c_url: *const c_char) {
+    let url = cstr_to_string(c_url);
+    let url = url.trim().to_string();
+    if !url.is_empty() {
+        match crate::net::parse_upstream_url(&url) {
+            Ok(p) => {
+                linfo!(
+                    " upstream proxy: {:?}://{}:{} (auth={})",
+                    p.kind,
+                    p.host,
+                    p.port,
+                    if p.username.is_empty() { "no" } else { "yes" }
+                );
+            }
+            Err(e) => {
+                lwarn!(" upstream proxy url ignored: {}", e);
+                return;
+            }
+        }
+    }
+    *UPSTREAM_PROXY_URL.write() = url;
+}
+
+/// Обход DPI: фрагментация первого TCP-сегмента (TLS ClientHello).
+#[unsafe(no_mangle)]
+pub extern "C" fn SetDpiBypass(enabled: c_int, frag_size: c_int, frag_delay_ms: c_int) {
+    DPI_BYPASS_ENABLED.store(enabled != 0, Ordering::Relaxed);
+    let mut size = frag_size;
+    if size < 1 {
+        size = 1;
+    }
+    if size > 256 {
+        size = 256;
+    }
+    DPI_FRAG_SIZE.store(size, Ordering::Relaxed);
+    let mut delay = frag_delay_ms;
+    if delay < 0 {
+        delay = 0;
+    }
+    if delay > 1000 {
+        delay = 1000;
+    }
+    DPI_FRAG_DELAY_MS.store(delay, Ordering::Relaxed);
+}
+
+/// Сводка по пулу доменов (для отчётов/диагностики).
+#[unsafe(no_mangle)]
+pub extern "C" fn GetDomainsSummary() -> *mut c_char {
+    let (total, user, cooling) = {
+        let cfg = CFPROXY.read();
+        let total = cfg.domains.len();
+        let user = cfg.user_domains.len();
+        drop(cfg);
+        let cooling = crate::config::DOMAIN_FAIL
+            .read()
+            .values()
+            .filter(|s| {
+                s.until
+                    .map(|u| u > std::time::Instant::now())
+                    .unwrap_or(false)
+            })
+            .count();
+        (total, user, cooling)
+    };
+    let upstream = {
+        let u = UPSTREAM_PROXY_URL.read();
+        if u.trim().is_empty() {
+            "direct".to_string()
+        } else {
+            "upstream".to_string()
+        }
+    };
+    let s = format!("domains={} user={} cooldown={} route={}", total, user, cooling, upstream);
+    CString::new(s).unwrap_or_default().into_raw()
 }
 
 /// # Safety
@@ -245,7 +370,25 @@ pub unsafe extern "C" fn SetCfProxyConfig(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SetCfWorkerDomains(c_domains: *const c_char) {
     let raw = cstr_to_string(c_domains);
-    *CF_WORKER_DOMAINS.write() = coerce_domain_list_str(&raw);
+    // Пользователь часто вставляет адрес целиком (https://…workers.dev/),
+    // поэтому нормализуем: схема/путь/порт отбрасываются, домен валидируется.
+    let mut domains: Vec<String> = Vec::new();
+    for item in coerce_domain_list_str(&raw) {
+        match crate::config::canonicalize_user_domain(&item) {
+            Some(d) => {
+                if !domains.contains(&d) {
+                    domains.push(d);
+                }
+            }
+            None => lwarn!(" worker: домен проигнорирован (некорректный): {}", item),
+        }
+    }
+    if !domains.is_empty() {
+        linfo!(" CF worker: задано доменов: {:?}", domains);
+        *CF_WORKER_DOMAINS.write() = domains;
+    } else if raw.trim().is_empty() {
+        *CF_WORKER_DOMAINS.write() = Vec::new();
+    }
 }
 
 /// # Safety
@@ -279,13 +422,146 @@ pub extern "C" fn SetProxyProtocol(v: c_int) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
     let s = cstr_to_string(c_secret);
-    if s.len() != 32 {
-        return;
+    match sanitize_secret(&s) {
+        Some(v) => *PROXY_SECRET.write() = v,
+        None => lwarn!("SetSecret: некорректный секрет проигнорирован"),
     }
-    if hex::decode(&s).is_err() {
-        return;
+}
+
+/// Диагностика маршрутов: пробует прямой WS, свой Cloudflare Worker и
+/// первую пару CF-доменов, пишет результат в лог и возвращает сводку.
+///
+/// Нужна, когда «прокси запущен, а Telegram не подключается»: сразу видно,
+/// какой маршрут на этой сети вообще проходит.
+#[unsafe(no_mangle)]
+pub extern "C" fn DiagnoseRoutes(dc: c_int) -> *mut c_char {
+    let dc = if dc <= 0 { 2 } else { dc };
+    let out = runtime().block_on(async move {
+        let probe_timeout = Duration::from_secs(6);
+        let mut parts: Vec<String> = Vec::new();
+
+        // 1) Прямой WS к kws{dc}.web.telegram.org
+        let mut direct = "skip".to_string();
+        for d in crate::proxy::ws_domains(dc, false) {
+            match crate::ws::ws_connect_secure(&d, &d, WS_PATH, probe_timeout, true).await {
+                Ok(ws) => {
+                    ws.close().await;
+                    direct = format!("ok ({})", d);
+                    break;
+                }
+                Err(e) => direct = format!("{} ({})", e.compact(), d),
+            }
+        }
+        linfo!(" диагностика: прямой WS -> {}", direct);
+        parts.push(format!("direct={}", direct));
+
+        // 2) Свой Cloudflare Worker
+        let workers = CF_WORKER_DOMAINS.read().clone();
+        if workers.is_empty() {
+            linfo!(" диагностика: свой worker не настроен");
+            parts.push("worker=не настроен".to_string());
+        } else {
+            let dst = crate::proxy::resolve_fallback_target(dc, false, false);
+            let path = format!("/apiws?dst={}&dc={}", dst, dc);
+            let mut res = "нет".to_string();
+            for w in workers.iter().take(2) {
+                match crate::ws::ws_connect_secure(w, w, &path, probe_timeout, true).await {
+                    Ok(ws) => {
+                        ws.close().await;
+                        res = format!("ok ({})", w);
+                        break;
+                    }
+                    Err(e) => res = format!("{} ({})", e.compact(), w),
+                }
+            }
+            linfo!(" диагностика: свой worker -> {}", res);
+            parts.push(format!("worker={}", res));
+        }
+
+        // 3) Пул CF-доменов (первые два)
+        let cf_domains: Vec<String> = CFPROXY.read().domains.iter().take(2).cloned().collect();
+        if cf_domains.is_empty() {
+            parts.push("cf=пул пуст".to_string());
+        } else {
+            let mut res = "нет".to_string();
+            for base in cf_domains {
+                let host = format!("kws{}.{}", dc, base);
+                match crate::ws::ws_connect_secure(&host, &host, WS_PATH, probe_timeout, true).await
+                {
+                    Ok(ws) => {
+                        ws.close().await;
+                        res = format!("ok ({})", host);
+                        break;
+                    }
+                    Err(e) => res = format!("{} ({})", e.compact(), host),
+                }
+            }
+            linfo!(" диагностика: пул CF -> {}", res);
+            parts.push(format!("cf={}", res));
+        }
+
+        parts.join("; ")
+    });
+    CString::new(out).unwrap_or_default().into_raw()
+}
+
+/// Недавние секреты (CSV): прокси принимает их наравне с активным.
+///
+/// Нужно для случая, когда пользователь сменил секрет в приложении, но в
+/// Telegram осталась ссылка со старым — иначе Telegram получает «bad
+/// handshake» и заваливает прокси переподключениями.
+///
+/// # Safety
+/// `c_secrets` — валидная C-строка или null (через запятую/пробел).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SetSecretHistory(c_secrets: *const c_char) {
+    let raw = cstr_to_string(c_secrets);
+    let mut list: Vec<String> = Vec::new();
+    for item in raw
+        .replace(',', " ")
+        .replace(';', " ")
+        .split_whitespace()
+    {
+        if let Some(s) = sanitize_secret(item) {
+            if !list.contains(&s) {
+                list.push(s);
+            }
+        }
     }
-    *PROXY_SECRET.write() = s;
+    if !list.is_empty() {
+        ldebug!(" SetSecretHistory: {} секрет(ов) в истории", list.len());
+    }
+    *SECRET_HISTORY.write() = list;
+}
+
+/// Активный секрет, с которым реально работает прокси (32 hex).
+/// Нужен UI, чтобы ссылка и настройки всегда совпадали с нативным состоянием.
+#[unsafe(no_mangle)]
+pub extern "C" fn GetActiveSecret() -> *mut c_char {
+    let s = PROXY_SECRET.read().clone();
+    CString::new(s).unwrap_or_default().into_raw()
+}
+
+/// Сверка секрета из UI с активным секретом прокси.
+/// 1 — совпадает, 0 — не совпадает, -1 — некорректный формат.
+///
+/// # Safety
+/// `c_secret` — валидная C-строка или null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn VerifyClientSecret(c_secret: *const c_char) -> c_int {
+    let raw = cstr_to_string(c_secret);
+    match sanitize_secret(&raw) {
+        Some(v) => {
+            // Совпадением считается и активный секрет, и любой из недавних:
+            // прокси принимает их все, значит ссылка рабочая.
+            if secret_candidates().iter().any(|(s, _)| *s == v) {
+                1
+            } else {
+                0
+            }
+        }
+        None => -1,
+    }
 }
 
 #[unsafe(no_mangle)]
