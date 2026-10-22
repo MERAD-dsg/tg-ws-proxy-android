@@ -2220,9 +2220,12 @@ async fn serve_core<R, W>(
     let preferred_route = route_preferred(dc);
     // История есть — идём проверенным маршрутом. Истории нет — запускаем
     // гонку прямого WS и worker (ниже), поэтому заранее worker не выбираем.
+    // Свой worker приоритетен, если он недавно работал или если прямой WS
+    // только что «умирал» (нет pong/данных).
     let prefer_worker = has_own_worker
         && !is_test_dc
-        && preferred_route == Some(RouteKind::Worker)
+        && (preferred_route == Some(RouteKind::Worker)
+            || route_recently_bad(dc, RouteKind::Direct))
         && !route_recently_bad(dc, RouteKind::Worker);
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || has_own_worker;
@@ -2323,6 +2326,7 @@ async fn serve_core<R, W>(
         && !is_test_dc
         && preferred_route.is_none()
         && !route_recently_bad(dc, RouteKind::Worker)
+        && !route_recently_bad(dc, RouteKind::Direct)
     {
         let race_dst = resolve_fallback_target(dc, is_media, is_test_dc);
         if !race_dst.is_empty() {

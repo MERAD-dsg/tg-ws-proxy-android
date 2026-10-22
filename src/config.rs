@@ -545,10 +545,13 @@ pub fn route_preferred(dc: i32) -> Option<RouteKind> {
 }
 
 /// Маршрут недавно «умирал» (нет pong / нет downstream)?
+///
+/// После `route_mark_bad` в `best` остаётся именно сломанный маршрут (а
+/// `best_at` сбрасывается), поэтому проверяем совпадение с `best`.
 pub fn route_recently_bad(dc: i32, route: RouteKind) -> bool {
     let map = ROUTE_HEALTH.read();
     match map.get(&dc) {
-        Some(h) => h.bad_at > 0.0 && now_monotonic() - h.bad_at <= ROUTE_BAD_TTL && h.best != route,
+        Some(h) => h.bad_at > 0.0 && now_monotonic() - h.bad_at <= ROUTE_BAD_TTL && h.best == route,
         None => false,
     }
 }
@@ -1122,7 +1125,8 @@ mod secret_tests {
         assert_eq!(route_preferred(dc), Some(RouteKind::Direct));
         route_mark_bad(dc, RouteKind::Direct);
         assert_eq!(route_preferred(dc), None);
-        assert!(route_recently_bad(dc, RouteKind::Worker));
+        assert!(route_recently_bad(dc, RouteKind::Direct));
+        assert!(!route_recently_bad(dc, RouteKind::Worker));
     }
 
     #[test]
